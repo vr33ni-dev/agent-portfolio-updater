@@ -85,10 +85,11 @@ python main.py username/repo-name
 Example:
 
 ```bash
-python main.py vreeni/agent-morning-briefing
+python main.py vr33ni-dev/agent-morning-briefing
 ```
 
 The agent will:
+
 1. Read the repo's README, languages, and metadata
 2. Generate a project card using Claude
 3. Insert it into your portfolio page
@@ -97,13 +98,13 @@ The agent will:
 ## Example Output
 
 ```
-🔍 Reading repo: vreeni/agent-morning-briefing
-📝 Will update: vreeni/vreeni.github.io
+🔍 Reading repo: vr33ni-dev/agent-morning-briefing
+📝 Will update: vr33ni/https://vr33ni.github.io/
 
-✅ PR created: https://github.com/vreeni/vreeni.github.io/pull/42
+✅ PR created: https://github.com/vr33ni/vr33ni.github.io/pull/42
 
 🎉 Done! Review your PR at:
-https://github.com/vreeni/vreeni.github.io/pull/42
+https://github.com/vr33ni/vr33ni.github.io/pull/42
 ```
 
 ## Stretch Goals
