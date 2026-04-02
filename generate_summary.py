@@ -17,10 +17,11 @@ def generate_summary(state: PortfolioState) -> dict:
 
 Based on the following repo info, generate a short, compelling project card in HTML.
 The card should include:
-- Project name as a link to the repo
+- Project name as a heading
+- Tech stack as a subtitle line (e.g. "Python · LangGraph · API Integration")
 - A 2-3 sentence description that sounds professional (not just the README intro)
-- Tech stack as small tags/badges
-- What makes this project interesting or unique
+- A bullet list of 2-3 key highlights
+- A "View on GitHub" link
 
 REPO INFO:
 Name: {repo['name']}
@@ -33,19 +34,24 @@ URL: {repo['url']}
 README (first 2000 chars):
 {repo['readme'][:2000]}
 
-Return ONLY the HTML for a single project card using this structure.
-Do not include any markdown, backticks, or explanation. Just raw HTML.
-Use simple, clean HTML with inline classes that work with most Jekyll themes.
-Example structure:
+Return ONLY the HTML for a single project card. No markdown, no backticks, no explanation.
+Match this exact structure and Tailwind CSS classes used by the existing cards on the page:
 
-<div class="project-card">
-  <h3><a href="REPO_URL">Project Name</a></h3>
-  <p>Description here.</p>
-  <div class="project-tags">
-    <span class="tag">Python</span>
-    <span class="tag">LangGraph</span>
-  </div>
+<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">
+  <h2 class="text-xl font-semibold mb-2">Project Name</h2>
+  <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">
+    Tech · Stack · Here
+  </p>
+  <p class="mb-4">
+    Description here.
+  </p>
+  <ul class="list-disc list-inside text-sm mb-4 space-y-1">
+    <li><strong>Key point:</strong> Detail here</li>
+    <li><strong>Key point:</strong> Detail here</li>
+  </ul>
+  <a href="REPO_URL" target="_blank" class="text-blue-500 hover:underline">View on GitHub</a>
 </div>
+<br />
 """
 
     response = llm.invoke(prompt)

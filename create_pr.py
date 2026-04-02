@@ -3,11 +3,9 @@ from datetime import datetime
 from github import Github
 from state import PortfolioState
 
-PORTFOLIO_FILE = "index.html"
-
 
 def create_pr(state: PortfolioState) -> dict:
-    """Create a branch, commit the updated portfolio, and open a PR."""
+    """Create a branch, commit the updated portfolio files, and open a PR."""
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(state["portfolio_repo"])
 
@@ -27,14 +25,15 @@ def create_pr(state: PortfolioState) -> dict:
         sha=base_sha,
     )
 
-    # Commit the updated file to the new branch
-    repo.update_file(
-        path=PORTFOLIO_FILE,
-        message=f"Add {project_name} to portfolio",
-        content=state["updated_file"],
-        sha=state["file_sha"],
-        branch=branch_name,
-    )
+    # Commit each updated language file to the new branch
+    for file_entry in state["updated_files"]:
+        repo.update_file(
+            path=file_entry["path"],
+            message=f"Add {project_name} to portfolio ({file_entry['path']})",
+            content=file_entry["content"],
+            sha=file_entry["sha"],
+            branch=branch_name,
+        )
 
     # Create the PR
     pr = repo.create_pull(

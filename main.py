@@ -9,13 +9,13 @@ from graph import build_graph
 def main():
     if len(sys.argv) < 2:
         print("Usage: python main.py <repo_name>")
-        print("Example: python main.py vreeni/agent-morning-briefing")
+        print("Example: python main.py vr33ni/agent-morning-briefing")
         sys.exit(1)
 
     repo_name = sys.argv[1]
 
     # ===== CONFIGURE THIS =====
-    PORTFOLIO_REPO = "vreeni/vreeni.github.io"  # Your GitHub Pages repo
+    PORTFOLIO_REPO = "vr33ni/portfolio"  # Your GitHub Pages repo
     # ==========================
 
     agent = build_graph()
@@ -25,6 +25,7 @@ def main():
         "portfolio_repo": PORTFOLIO_REPO,
         "repo_info": {},
         "summary_html": "",
+        "updated_files": [],
         "updated_file": "",
         "file_sha": "",
         "pr_url": "",

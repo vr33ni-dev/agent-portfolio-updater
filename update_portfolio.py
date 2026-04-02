@@ -2,9 +2,8 @@ import os
 from github import Github
 from state import PortfolioState
 
-# Path to the portfolio page in the Jekyll repo
-# Change this if your projects are on a different page
-PORTFOLIO_FILE = "index.html"
+# All language versions of the portfolio page to update
+PORTFOLIO_FILES = ["work.html", "work.es.html", "work.de.html"]
 
 # Marker comment where new projects get inserted
 # Add this comment to your portfolio HTML where you want projects to appear:
@@ -13,31 +12,37 @@ MARKER = "<!-- NEW_PROJECTS_HERE -->"
 
 
 def update_portfolio(state: PortfolioState) -> dict:
-    """Read current portfolio HTML and insert the new project card."""
+    """Read current portfolio HTML files and insert the new project card into each."""
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(state["portfolio_repo"])
 
-    # Get current portfolio file
-    file = repo.get_contents(PORTFOLIO_FILE)
-    current_html = file.decoded_content.decode("utf-8")
-    file_sha = file.sha
+    updated_files = []
 
-    # Insert new project card after the marker
-    if MARKER in current_html:
-        updated_html = current_html.replace(
-            MARKER,
-            f"{MARKER}\n\n{state['summary_html']}\n",
-        )
-    else:
-        # If no marker found, warn but still prepare the content
-        print(
-            f"⚠️  Marker '{MARKER}' not found in {PORTFOLIO_FILE}."
-            f"\n   Add it to your HTML where you want projects inserted."
-            f"\n   The project card was generated but couldn't be placed."
-        )
-        updated_html = current_html
+    for portfolio_file in PORTFOLIO_FILES:
+        file = repo.get_contents(portfolio_file)
+        current_html = file.decoded_content.decode("utf-8")
+
+        if MARKER in current_html:
+            updated_html = current_html.replace(
+                MARKER,
+                f"{MARKER}\n\n{state['summary_html']}\n",
+            )
+        else:
+            print(
+                f"⚠️  Marker '{MARKER}' not found in {portfolio_file}."
+                f"\n   Add <!-- NEW_PROJECTS_HERE --> where you want cards inserted."
+                f"\n   Skipping {portfolio_file}."
+            )
+            continue
+
+        updated_files.append({
+            "path": portfolio_file,
+            "content": updated_html,
+            "sha": file.sha,
+        })
 
     return {
-        "updated_file": updated_html,
-        "file_sha": file_sha,
+        "updated_files": updated_files,
+        "updated_file": updated_files[0]["content"] if updated_files else "",
+        "file_sha": updated_files[0]["sha"] if updated_files else "",
     }
