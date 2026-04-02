@@ -25,6 +25,8 @@ def main():
         "portfolio_repo": PORTFOLIO_REPO,
         "repo_info": {},
         "summary_html": "",
+        "summary_html_es": "",
+        "summary_html_de": "",
         "updated_files": [],
         "updated_file": "",
         "file_sha": "",

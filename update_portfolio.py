@@ -16,16 +16,23 @@ def update_portfolio(state: PortfolioState) -> dict:
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(state["portfolio_repo"])
 
+    lang_map = {
+        "work.html": state["summary_html"],
+        "work.es.html": state["summary_html_es"],
+        "work.de.html": state["summary_html_de"],
+    }
+
     updated_files = []
 
     for portfolio_file in PORTFOLIO_FILES:
         file = repo.get_contents(portfolio_file)
         current_html = file.decoded_content.decode("utf-8")
+        card_html = lang_map[portfolio_file]
 
         if MARKER in current_html:
             updated_html = current_html.replace(
                 MARKER,
-                f"{MARKER}\n\n{state['summary_html']}\n",
+                f"{MARKER}\n\n{card_html}\n",
             )
         else:
             print(
