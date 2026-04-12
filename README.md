@@ -78,7 +78,7 @@ Runs a targeted pass over all cards — no full regeneration unless actually nee
 | Tailwind CSS class consistency | Regex patch, no LLM |
 | Card order in ES/DE vs EN | Structural reorder, no LLM |
 | Tech stack subtitle accuracy | LLM: KEEP or corrected string |
-| Description paragraph accuracy | LLM: KEEP or targeted rewrite |
+| Description paragraph accuracy | LLM: generate → critique loop (up to 3 retries) → your review |
 
 All changes are committed together in one PR. If an open audit PR already exists, it pushes to that branch instead.
 
@@ -155,15 +155,23 @@ The audit will check every card, print what changed, and ask for confirmation be
     ✅ work.es.html already in correct order
     🔀 Reordered work.de.html
 
-⚙️  Checking tech stacks...
-    ✅ eisbachtracker — tech stack current
-    🔧 morning-briefing: 'Python · OpenAI' → 'Python · LangGraph · OpenAI · REST APIs'
+⚙️  Checking card content (tech stack + description)...
+    FRESH  eisbachtracker
+    STALE  morning-briefing
+       Tech stack:
+         Current:  Python · OpenAI
+         Proposed: Python · LangGraph · OpenAI · REST APIs
+         Accept? [y/n/edit] y
+       Description:
+       ────────────────────────────────────────────────────────────
+       Automates a daily morning briefing using LangGraph and
+       OpenAI, fetching news, weather, and calendar events.
+         • Built with LangGraph for agent orchestration
+         • Sends briefing via email every morning
+       ────────────────────────────────────────────────────────────
+         Accept? [y/n/improve] y
 
-📝 Checking descriptions...
-    ✅ eisbachtracker — description accurate
-    ✏️  morning-briefing — rewriting description
-
-1 file(s) updated: work.de.html, work.html
+2 file(s) updated: work.de.html, work.html
 Push changes to PR? [y/N] y
 
 ✅ PR: https://github.com/vr33ni/portfolio/pull/12

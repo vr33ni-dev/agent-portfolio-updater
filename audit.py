@@ -26,6 +26,7 @@ from github import Github, Auth
 from langchain_anthropic import ChatAnthropic
 from update_portfolio import _extract_repo_urls, PORTFOLIO_FILES, MARKER
 from create_pr import PR_REVIEWER
+from read_repo import _fetch_code_context, _fetch_subdir_readmes
 
 # ===== CONFIGURE THIS =====
 PORTFOLIO_REPO = "vr33ni/portfolio"
@@ -62,6 +63,20 @@ def extract_repo_links(html: str) -> list[str]:
                 seen.add(repo_path)
                 repos.append(repo_path)
     return repos
+
+
+def _card_repo_paths(chunk: str) -> list[str]:
+    """Return list of 'owner/name' repo paths found in a card chunk."""
+    return extract_repo_links(chunk)
+
+
+def _card_label(chunk: str) -> str:
+    """Extract the card title from the <h2> tag, falling back to first repo name."""
+    m = re.search(r'<h2[^>]*>(.*?)</h2>', chunk, re.DOTALL)
+    if m:
+        return re.sub(r'<[^>]+>', '', m.group(1)).strip()
+    urls = re.findall(r'https://github\.com/[a-zA-Z0-9_.-]+/([a-zA-Z0-9_.-]+)', chunk)
+    return urls[0] if urls else "card"
 
 
 # ── Session open / close ─────────────────────────────────────────────────────
@@ -245,30 +260,75 @@ def _fix_order_inplace(fetched: dict) -> list[str]:
 
 
 def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> list[str]:
-    """Check tech stack and description per card. Prints one FRESH/STALE per card.
-    Only prompts for review on STALE cards. Returns list of changed filenames."""
+    """Check tech stack and description per card (not per repo).
+    A card may link to multiple repos (e.g. frontend + backend) — all are fetched and
+    their data is aggregated before running verdicts.
+    Prints one FRESH/STALE line per card. Returns list of changed filenames."""
     en_html = fetched["work.html"]["html"]
-    repo_paths = extract_repo_links(en_html)
+    en_parts = re.split(r'(?=<div class="bg-white)', en_html)
     changed = []
 
-    for repo_path in repo_paths:
-        try:
-            repo = g.get_repo(repo_path)
-            languages = list(repo.get_languages().keys())
-            topics = repo.get_topics()
-            try:
-                readme = repo.get_readme().decoded_content.decode("utf-8")
-            except Exception:
-                readme = ""
-        except Exception:
-            print(f"    ⚠️  Could not fetch {repo_path} — skipping")
+    for en_card in en_parts:
+        card_paths = _card_repo_paths(en_card)
+        if not card_paths:
             continue
 
-        card_url = repo.html_url
-        en_parts = re.split(r'(?=<div class="bg-white)', en_html)
-        en_card = next((p for p in en_parts if card_url in p or card_url.rstrip("/") in p), None)
-        if not en_card:
+        label = _card_label(en_card)
+
+        # ── Fetch all repos linked from this card ────────────────────────
+        repos_data = []
+        for repo_path in card_paths:
+            try:
+                repo = g.get_repo(repo_path)
+                languages = list(repo.get_languages().keys())
+                topics = repo.get_topics()
+                repo_description = repo.description or ""
+                try:
+                    readme = repo.get_readme().decoded_content.decode("utf-8")
+                except Exception:
+                    readme = ""
+                subdir_readmes = _fetch_subdir_readmes(repo)
+                code_context = _fetch_code_context(repo)
+                repos_data.append({
+                    "repo": repo,
+                    "languages": languages,
+                    "topics": topics,
+                    "repo_description": repo_description,
+                    "readme": readme,
+                    "subdir_readmes": subdir_readmes,
+                    "code_context": code_context,
+                })
+            except Exception:
+                print(f"    ⚠️  Could not fetch {repo_path} — skipping")
+
+        if not repos_data:
             continue
+
+        # ── Aggregate context across all repos ───────────────────────────
+        all_languages = []
+        all_topics = []
+        readme_parts = []
+        code_parts = []
+        for rd in repos_data:
+            all_languages.extend(rd["languages"])
+            all_topics.extend(rd["topics"])
+            if rd["readme"]:
+                readme_parts.append(f"[{rd['repo'].name}]\n{rd['readme'][:1500]}")
+            if rd["subdir_readmes"]:
+                readme_parts.append(f"[{rd['repo'].name} subdir READMEs]\n{rd['subdir_readmes'][:500]}")
+            if rd["code_context"]:
+                code_parts.append(f"[{rd['repo'].name}]\n{rd['code_context'][:800]}")
+
+        languages_str = ", ".join(dict.fromkeys(all_languages))
+        topics_str = ", ".join(dict.fromkeys(all_topics))
+        readme_str = "\n\n".join(readme_parts)
+        code_str = "\n\n".join(code_parts)
+        repo_desc_str = "; ".join(
+            rd["repo_description"] for rd in repos_data if rd["repo_description"]
+        )
+
+        # canonical URLs for matching chunks across all three HTML files
+        card_urls = [rd["repo"].html_url.rstrip("/") for rd in repos_data]
 
         # ── Tech stack verdict ───────────────────────────────────────────
         new_tech = None
@@ -276,35 +336,41 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
         current_tech = tech_match.group(1).strip() if tech_match else None
         if current_tech:
             tech_verdict = llm.invoke(
-                f'Portfolio card for "{repo.name}" has tech stack line: {current_tech}\n'
-                f'GitHub reports for THIS repo — Languages: {", ".join(languages)}, Topics: {", ".join(topics)}\n\n'
-                f'The card may intentionally cover a full-stack project that spans multiple repos or includes '
-                f'backend services, databases, deployment tools, or other infrastructure not reflected in this '
-                f'repo\'s language stats.\n\n'
+                f'Portfolio card "{label}" has tech stack line: {current_tech}\n\n'
+                f'GitHub data across all linked repos:\n'
+                f'  Languages: {languages_str}\n'
+                f'  Topics: {topics_str}\n'
+                f'  Descriptions: {repo_desc_str}\n\n'
+                f'Code context:\n{code_str[:2000]}\n\n'
+                f'This card may cover a full-stack project spanning multiple repos '
+                f'(e.g. a Vue.js frontend repo + a Spring Boot backend repo).\n\n'
                 f'Rules:\n'
-                f'- Only suggest a change if the current line contains something genuinely wrong or if a key '
-                f'technology from GitHub\'s data is clearly missing.\n'
-                f'- Do NOT remove technologies just because they don\'t appear in this repo\'s language stats.\n'
-                f'- If the line looks reasonable given the card context, reply KEEP.\n'
+                f'- Only suggest a change if the current line is genuinely wrong or a key '
+                f'technology visible in the repos is clearly missing.\n'
+                f'- Do NOT remove technologies just because they are absent from one repo\'s language stats.\n'
+                f'- If the line looks reasonable, reply KEEP.\n'
                 f'- If a change is needed, reply with the corrected string only '
-                f'(format: "Tech · Stack · Here", 3-5 most important technologies, keep technical names in English).'
+                f'(format: "Tech · Stack · Here", 3-5 most important technologies, '
+                f'keep technical names in English).'
             ).content.strip()
             if not tech_verdict.upper().startswith("KEEP"):
                 new_tech = tech_verdict
 
         # ── Description verdict ──────────────────────────────────────────
         needs_desc = False
-        if readme:
+        if readme_str:
             desc_verdict = llm.invoke(
-                f'Portfolio card for "{repo.name}":\n{en_card}\n\n'
-                f'README (first 1500 chars):\n{readme[:1500]}\n\n'
-                f'Does the card description contradict or omit something that is factually present in the README?\n\n'
-                f'Rules:\n'
-                f'- Reply KEEP unless the README shows the codebase has genuinely changed in a way that '
-                f'makes the card description factually wrong (e.g. a described feature was removed, the '
-                f'core purpose changed, or a key new capability is completely absent from the card).\n'
-                f'- Wording differences, missing minor details, or stylistic improvements are NOT a reason to update.\n'
-                f'- If the README broadly matches what the card says, reply KEEP.\n'
+                f'Portfolio card "{label}":\n{en_card}\n\n'
+                f'GitHub repo descriptions: {repo_desc_str}\n\n'
+                f'READMEs:\n{readme_str[:3000]}\n\n'
+                f'Code context:\n{code_str[:2000]}\n\n'
+                f'Compare the card description against all of the above. Reply UPDATE if either:\n'
+                f'  (a) The card says something factually incorrect or contradictory '
+                f'(e.g. wrong framework, wrong language), OR\n'
+                f'  (b) The project has changed significantly and the card no longer reflects it.\n\n'
+                f'Reply KEEP if:\n'
+                f'  - The card is broadly accurate and consistent with the repos.\n'
+                f'  - Differences are only in wording, level of detail, or style.\n'
                 f'- Default to KEEP when in doubt.\n'
                 f'Reply with just KEEP or UPDATE.'
             ).content.strip().upper()
@@ -312,10 +378,10 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
 
         # ── Print one status line per card ───────────────────────────────
         if new_tech is None and not needs_desc:
-            print(f"    FRESH  {repo.name}")
+            print(f"    FRESH  {label}")
             continue
 
-        print(f"    STALE  {repo.name}")
+        print(f"    STALE  {label}")
 
         # ── Review tech stack ────────────────────────────────────────────
         if new_tech is not None:
@@ -335,7 +401,7 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                 file_parts = re.split(r'(?=<div class="bg-white)', old)
                 new_parts = []
                 for part in file_parts:
-                    if card_url in part or card_url.rstrip("/") in part:
+                    if any(u in part for u in card_urls):
                         new_parts.append(TECH_P.sub(
                             lambda m, t=new_tech: m.group(0).replace(m.group(1), t),
                             part, count=1,
@@ -352,21 +418,57 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
         if needs_desc:
             en_file_parts = re.split(r'(?=<div class="bg-white)', fetched["work.html"]["html"])
             en_card_idx = next(
-                (i for i, p in enumerate(en_file_parts) if card_url in p or card_url.rstrip("/") in p),
+                (i for i, p in enumerate(en_file_parts) if any(u in p for u in card_urls)),
                 None,
             )
             if en_card_idx is None:
                 continue
-            en_new_card = llm.invoke(
-                f'Rewrite ONLY the description paragraph and bullet list for this portfolio card.\n\n'
-                f'Current card:\n{en_file_parts[en_card_idx]}\n\n'
-                f'README (first 1500 chars):\n{readme[:1500]}\n\n'
-                f'Rules:\n'
-                f'- Keep the project name heading, tech subtitle, and GitHub link EXACTLY as-is.\n'
-                f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
-                f'- Write in English.\n'
-                f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
-            ).content.strip()
+
+            def _generate_desc(card_chunk, feedback_hint=""):
+                extra = f'\nFeedback to address: {feedback_hint}\n' if feedback_hint else ''
+                return llm.invoke(
+                    f'Rewrite ONLY the description paragraph and bullet list for this portfolio card.\n\n'
+                    f'Current card:\n{card_chunk}\n\n'
+                    f'READMEs:\n{readme_str[:2500]}\n\n'
+                    f'Code context:\n{code_str[:1500]}\n\n'
+                    f'Rules:\n'
+                    f'- Keep the project name heading, tech subtitle, and GitHub link(s) EXACTLY as-is.\n'
+                    f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
+                    f'- Description: 2-3 sentences. Bullets: 2-3 items.\n'
+                    f'- Write in English.\n'
+                    f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
+                    f'{extra}'
+                ).content.strip()
+
+            def _critique_desc(card_chunk):
+                response = llm.invoke(
+                    f'You are reviewing a rewritten portfolio project card.\n\n'
+                    f'Evaluate against these criteria:\n'
+                    f'1. Accuracy — correctly reflects the repo(s) purpose and tech stack\n'
+                    f'2. Length — description 2-3 sentences, 2-3 bullet points (not more)\n'
+                    f'3. No raw README copy — must be a concise portfolio write-up\n'
+                    f'4. Structure — uses correct Tailwind CSS classes\n\n'
+                    f'READMEs:\n{readme_str[:2000]}\n\n'
+                    f'Code context:\n{code_str[:1000]}\n\n'
+                    f'CARD:\n{card_chunk}\n\n'
+                    f'Respond with exactly two lines:\n'
+                    f'Line 1: APPROVED or REJECTED\n'
+                    f'Line 2: If REJECTED, one concise sentence of specific feedback. '
+                    f'If APPROVED, write "Looks good."'
+                ).content.strip()
+                lines = response.splitlines()
+                verdict = lines[0].strip().upper()
+                feedback_msg = lines[1].strip() if len(lines) > 1 else ""
+                return verdict, feedback_msg
+
+            en_new_card = _generate_desc(en_file_parts[en_card_idx])
+            for _attempt in range(3):
+                verdict, critique_fb = _critique_desc(en_new_card)
+                if verdict == "APPROVED":
+                    print(f"       ✅ Critique approved (attempt {_attempt + 1})")
+                    break
+                print(f"       🔁 Critique retry {_attempt + 1}/3: {critique_fb}")
+                en_new_card = _generate_desc(en_file_parts[en_card_idx], feedback_hint=critique_fb)
 
             sep = "─" * 60
             print(f"       Description:")
@@ -403,7 +505,7 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                     old = fetched[filename]["html"]
                     file_parts = re.split(r'(?=<div class="bg-white)', old)
                     card_idx = next(
-                        (i for i, p in enumerate(file_parts) if card_url in p or card_url.rstrip("/") in p),
+                        (i for i, p in enumerate(file_parts) if any(u in p for u in card_urls)),
                         None,
                     )
                     if card_idx is None:
@@ -411,9 +513,9 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                     new_card = llm.invoke(
                         f'Rewrite ONLY the description paragraph and bullet list for this portfolio card.\n\n'
                         f'Current card:\n{file_parts[card_idx]}\n\n'
-                        f'README (first 1500 chars):\n{readme[:1500]}\n\n'
+                        f'READMEs:\n{readme_str[:2500]}\n\n'
                         f'Rules:\n'
-                        f'- Keep the project name heading, tech subtitle, and GitHub link EXACTLY as-is.\n'
+                        f'- Keep the project name heading, tech subtitle, and GitHub link(s) EXACTLY as-is.\n'
                         f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
                         f'- {lang_instruction}\n'
                         f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
