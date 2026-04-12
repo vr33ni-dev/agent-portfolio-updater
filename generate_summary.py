@@ -30,6 +30,17 @@ def generate_summary(state: PortfolioState) -> dict:
 </div>
 <br />"""
 
+    feedback = state.get("critique_feedback", "")
+    user_improvement = state.get("user_improvement_feedback", "")
+    current_card = state.get("summary_html", "")
+
+    if user_improvement and current_card:
+        feedback_section = f"\n\nThe user wants you to improve the existing card. Their request:\n{user_improvement}\n\nExisting card to refine (keep what works, only change what the user asked):\n{current_card}\n"
+    elif feedback:
+        feedback_section = f"\n\nPREVIOUS ATTEMPT WAS REJECTED. Feedback to address:\n{feedback}\n"
+    else:
+        feedback_section = ""
+
     base_prompt = f"""You are helping a developer update their GitHub portfolio website.
 
 Based on the following repo info, generate a short, compelling project card in HTML.
@@ -51,6 +62,9 @@ URL: {repo['url']}
 README (first 2000 chars):
 {repo['readme'][:2000]}
 
+CODE CONTEXT (key config/manifest files):
+{repo.get('code_context', '')[:2000]}
+{feedback_section}
 Return ONLY the HTML. No markdown, no backticks, no explanation.
 Match this exact Tailwind CSS structure:
 {card_template}
@@ -69,4 +83,6 @@ Match this exact Tailwind CSS structure:
         "summary_html": results["en"],
         "summary_html_es": results["es"],
         "summary_html_de": results["de"],
+        "user_improvement_feedback": "",  # Clear after use so critique retries don't re-apply it
+        "critique_feedback": "",          # Clear sentinel so critique runs fresh
     }

@@ -11,6 +11,10 @@ class PortfolioState(TypedDict):
     summary_html: str           # Generated portfolio card HTML (EN)
     summary_html_es: str        # Generated portfolio card HTML (ES)
     summary_html_de: str        # Generated portfolio card HTML (DE)
+    critique_feedback: str      # Feedback from critique node (empty = approved)
+    critique_retries: int       # Number of critique retries so far
+    user_improvement_feedback: str  # User's "improve" instruction for the next generate pass
+    skip_critique: bool         # Skip critique when user is driving the rewrite
     updated_files: list         # List of {path, content, sha} for each language file
     updated_file: str           # Full updated portfolio HTML (kept for compatibility)
     file_sha: str               # SHA of current file (kept for compatibility)
