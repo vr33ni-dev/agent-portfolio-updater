@@ -1,5 +1,5 @@
 """
-Tests for audit.py — no network calls, no LLM calls, no user input.
+Tests for audit.py and sync_translations.py — no network calls, no LLM calls, no user input.
 """
 
 import re
@@ -12,6 +12,13 @@ from audit import (
     _card_repo_paths,
     extract_repo_links,
     _fix_card_content_inplace,
+)
+from sync_translations import (
+    _split_sections,
+    _section_anchor,
+    _visible_text,
+    _lang_filename,
+    _sync_file,
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -221,3 +228,102 @@ def test_multi_repo_card_produces_one_status(mock_code, mock_subdirs, capsys):
     status_lines = [l for l in captured.out.splitlines() if "FRESH" in l or "STALE" in l]
     assert len(status_lines) == 1
     assert "Sales Assistant" in status_lines[0]
+
+
+# ── Unit tests: sync_translations helpers ────────────────────────────────────
+
+def test_split_sections_card_page():
+    html = '<div class="bg-white">card1</div>\n<div class="bg-white">card2</div>'
+    parts = [p for p in _split_sections(html) if p.strip()]
+    assert len(parts) == 2
+
+
+def test_split_sections_section_page():
+    html = (
+        "<header>top</header>"
+        '<section id="about">About</section>'
+        '<section id="skills">Skills</section>'
+    )
+    parts = _split_sections(html)
+    assert len(parts) == 3
+
+
+def test_section_anchor_github_url():
+    chunk = '<a href="https://github.com/vr33ni/my-project">link</a>'
+    assert _section_anchor(chunk) == "https://github.com/vr33ni/my-project"
+
+
+def test_section_anchor_heading():
+    chunk = '<section><h2 class="title">About Me</h2><p>text</p></section>'
+    assert _section_anchor(chunk) == "about me"
+
+
+def test_section_anchor_id_over_heading():
+    chunk = '<section id="contact"><h2 class="title">Contact</h2><p>text</p></section>'
+    assert _section_anchor(chunk) == "contact"
+
+
+def test_section_anchor_none():
+    assert _section_anchor("<p>no heading or url</p>") is None
+
+
+def test_lang_filename():
+    assert _lang_filename("index.html", "es") == "index.es.html"
+    assert _lang_filename("work.html", "de") == "work.de.html"
+
+
+# ── Integration test: missing section gets translated and added ───────────────
+
+@patch("builtins.input", return_value="y")
+def test_sync_file_missing_section(mock_input):
+    """ES page is missing a section that exists in EN → LLM translates it, user accepts."""
+    EN_HTML = (
+        "<header>nav</header>"
+        "<section><h2>About Me</h2><p>I am a developer.</p></section>"
+        "<section><h2>New Section</h2><p>Brand new content.</p></section>"
+    )
+    ES_HTML = (
+        "<header>nav</header>"
+        "<section><h2>About Me</h2><p>Soy desarrolladora.</p></section>"
+    )
+    TRANSLATED = "<section><h2>Nueva Sección</h2><p>Contenido nuevo.</p></section>"
+
+    def _mock_contents(filename, ref=None):
+        c = MagicMock()
+        c.decoded_content = (EN_HTML if filename == "about.html" else ES_HTML).encode()
+        return c
+
+    portfolio = MagicMock()
+    portfolio.get_contents.side_effect = lambda f, ref=None: (
+        _mock_contents(f, ref)
+        if f in ("about.html", "about.es.html")
+        else (_ for _ in ()).throw(Exception("not found"))
+    )
+
+    llm = MagicMock()
+    llm.invoke.return_value.content = TRANSLATED
+
+    with patch("sync_translations.LANGS", ("es",)):
+        updates = _sync_file(llm, portfolio, "about.html", "main")
+
+    assert "about.es.html" in updates
+    assert "Nueva Sección" in updates["about.es.html"]
+
+
+def test_sync_file_in_sync():
+    """When EN and ES already share all sections, no updates should be produced."""
+    SHARED = (
+        "<header>nav</header>"
+        "<section><h2>About Me</h2><p>content</p></section>"
+    )
+
+    portfolio = MagicMock()
+    portfolio.get_contents.return_value.decoded_content = SHARED.encode()
+
+    llm = MagicMock()
+
+    with patch("sync_translations.LANGS", ("es",)):
+        updates = _sync_file(llm, portfolio, "about.html", "main")
+
+    assert updates == {}
+    llm.invoke.assert_not_called()
