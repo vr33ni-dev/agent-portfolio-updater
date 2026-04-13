@@ -96,8 +96,23 @@ def _make_llm():
         call_count["n"] += 1
         response = MagicMock()
 
+        if "Improve this" in prompt:
+            if "Spanish" in prompt:
+                response.content = (
+                    '<section id="contact">\n'
+                    '  <h2 class="title">Contacto (improved)</h2>\n'
+                    '  <p>Puedes contactarme en hello@example.com o en LinkedIn.</p>\n'
+                    '</section>'
+                )
+            else:
+                response.content = (
+                    '<section id="contact">\n'
+                    '  <h2 class="title">Kontakt (improved)</h2>\n'
+                    '  <p>Du kannst mich unter hello@example.com oder auf LinkedIn erreichen.</p>\n'
+                    '</section>'
+                )
         # Detect language from the lang_label injected by _translate()
-        if "Spanish" in prompt:
+        elif "Spanish" in prompt:
             response.content = TRANSLATED["es"]
         elif "German" in prompt:
             response.content = TRANSLATED["de"]
