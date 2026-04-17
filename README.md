@@ -70,15 +70,30 @@ A LangGraph agent that reads your GitHub repos, generates portfolio-ready projec
 
 ### Audit (`audit.py`)
 
-Runs a targeted pass over all cards — no full regeneration unless actually needed:
+Runs a targeted three-phase pass over all cards — no full regeneration unless actually needed:
+
+**Phase 1 — English Baseline & Repo Check**
 
 | Check | Method |
 |-------|--------|
 | Transferred/stale repo URLs | String replace, no LLM |
-| Tailwind CSS class consistency | Regex patch, no LLM |
-| Card order in ES/DE vs EN | Structural reorder, no LLM |
 | Tech stack subtitle accuracy | LLM: KEEP or corrected string |
 | Description paragraph accuracy | LLM: generate → critique loop (up to 3 retries) → your review |
+
+**Phase 2 — HTML Structure Consistency**
+
+| Check | Method |
+|-------|--------|
+| Missing HTML elements in ES/DE vs EN | Element count diff, no LLM |
+| Tailwind CSS class consistency | Regex patch, no LLM |
+| Card order in ES/DE vs EN | Structural reorder, no LLM |
+| Blocks commented-out in EN but live in translations | Fingerprint match, no LLM |
+
+**Phase 3 — Translation Content Review**
+
+| Check | Method |
+|-------|--------|
+| Sections present in EN but missing from ES/DE | LLM: translate missing section → your review |
 
 All changes are committed together in one PR. If an open audit PR already exists, it pushes to that branch instead.
 
@@ -145,8 +160,8 @@ The audit will check every card, print what changed, and ask for confirmation be
 ## Example Output
 
 ```
-🔗 Checking links...
-    ✅ All links are current
+� Checking element structure vs EN...
+    ✅ Element structure matches EN
 
 🎨 Checking styling...
     ✅ Styling is consistent
@@ -155,13 +170,16 @@ The audit will check every card, print what changed, and ask for confirmation be
     ✅ work.es.html already in correct order
     🔀 Reordered work.de.html
 
+🔍 Checking commented-out block drift in translations...
+    ✅ No commented-out drift found
+
 ⚙️  Checking card content (tech stack + description)...
     FRESH  eisbachtracker
     STALE  morning-briefing
        Tech stack:
          Current:  Python · OpenAI
          Proposed: Python · LangGraph · OpenAI · REST APIs
-         Accept? [y/n/edit] y
+         Accept? [y/n/edit/back] y
        Description:
        ────────────────────────────────────────────────────────────
        Automates a daily morning briefing using LangGraph and
@@ -169,7 +187,7 @@ The audit will check every card, print what changed, and ask for confirmation be
          • Built with LangGraph for agent orchestration
          • Sends briefing via email every morning
        ────────────────────────────────────────────────────────────
-         Accept? [y/n/improve] y
+         Accept? [y/n/improve/back] y
 
 2 file(s) updated: work.de.html, work.html
 Push changes to PR? [y/N] y
