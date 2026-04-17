@@ -1,14 +1,20 @@
 """
-audit.py — Check if existing portfolio project cards are still up to date.
+audit.py — Interactive three-phase portfolio audit.
 
-Reads all portfolio HTML files, then for each card:
+Phase 1 — English Baseline & Repo Check:
   - Fixes stale/transferred GitHub links (no LLM)
-  - Normalizes Tailwind CSS classes (no LLM)
-  - Corrects card order in ES/DE to match EN (no LLM)
-  - Updates tech stack subtitle if languages/topics have changed (LLM, one call per card)
-  - Rewrites description paragraph + bullets if the README has drifted (LLM, one call per card)
+  - Updates tech stack subtitle + description if repos have changed (LLM)
 
-All fixes are applied in one pass and committed as a single PR.
+Phase 2 — HTML Structure Consistency:
+  - Normalizes Tailwind CSS classes across all language files (no LLM)
+  - Corrects card order in ES/DE to match EN (no LLM)
+  - Removes blocks that are commented-out in EN but present in translations (no LLM)
+
+Phase 3 — Translation Content Review:
+  - Detects sections missing from ES/DE translations and offers to add them (LLM)
+
+All phases are interactive: each issue can be accepted, rejected, improved, or skipped.
+At the end, all accumulated changes are committed as a single PR.
 
 Usage:
     python audit.py
@@ -140,7 +146,8 @@ def _close_fix_session(portfolio, fetched: dict, changed_files: list, read_ref: 
     try:
         pr.create_review_request(reviewers=[PR_REVIEWER])
     except Exception as e:
-        print(f"⚠️  Could not add reviewer: {e}")
+        if "review cannot be requested from pull request author" not in str(e).lower():
+            print(f"⚠️  Could not add reviewer: {e}")
     return pr.html_url
 
 
@@ -530,7 +537,216 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
     return changed
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Commented-block drift check ──────────────────────────────────────────────
+
+def _element_bounds(html: str, fingerprint: str) -> tuple[int, int] | None:
+    """Return (start, end) of the outermost HTML element containing fingerprint."""
+    idx = html.find(fingerprint)
+    if idx == -1:
+        return None
+    # Walk backwards to the nearest non-closing, non-comment opening tag
+    tag_start = idx
+    while tag_start > 0:
+        tag_start = html.rfind('<', 0, tag_start)
+        if tag_start < 0:
+            return None
+        snippet = html[tag_start:]
+        if not snippet.startswith('</') and not snippet.startswith('<!--'):
+            break
+    tag_match = re.match(r'<(\w+)', html[tag_start:])
+    if not tag_match:
+        return None
+    tag_name = tag_match.group(1)
+    close = f'</{tag_name}>'
+    open_pat = re.compile(f'<{tag_name}[\\s>]')
+    depth = 1
+    pos = html.find('>', tag_start) + 1
+    while depth > 0 and pos < len(html):
+        next_close = html.find(close, pos)
+        m = open_pat.search(html, pos)
+        next_open = m.start() if m else -1
+        if next_close == -1:
+            return None
+        if next_open != -1 and next_open < next_close:
+            tag_end = html.find('>', next_open)
+            if tag_end > 0 and html[tag_end - 1] != '/':
+                depth += 1
+            pos = next_open + 1
+        else:
+            depth -= 1
+            pos = next_close + len(close)
+    return tag_start, pos
+
+
+def _fix_commented_blocks_inplace(portfolio, fetched: dict, read_ref: str) -> list[str]:
+    """Find blocks that are commented-out in EN but uncommented in translations.
+    Offers to remove them. Returns list of changed filenames."""
+    try:
+        repo_root = portfolio.get_contents("", ref=read_ref)
+        all_en_pages = [
+            f.name for f in repo_root
+            if f.name.endswith(".html")
+            and not re.search(r'\.(es|de)\.html$', f.name)
+            and f.name not in {"404.html"}
+        ]
+    except Exception as e:
+        print(f"  ⚠️  Could not list repo contents: {e}")
+        return []
+
+    changed = []
+
+    for en_filename in all_en_pages:
+        if en_filename in fetched:
+            en_html = fetched[en_filename]["html"]
+        else:
+            try:
+                f = portfolio.get_contents(en_filename, ref=read_ref)
+                en_html = f.decoded_content.decode()
+            except Exception:
+                continue
+
+        # Find HTML comment blocks that contain actual markup (>100 non-whitespace chars)
+        comment_blocks = re.findall(r'<!--(.*?)-->', en_html, re.DOTALL)
+        significant = [c for c in comment_blocks if len(c.strip()) > 100 and '<' in c]
+        if not significant:
+            continue
+
+        base, ext = en_filename.rsplit('.', 1)
+        for block in significant:
+            # Build fingerprints: Liquid template vars and long href values are unique
+            fingerprints = re.findall(r'\{\{[^}]+\}\}', block)
+            fingerprints += re.findall(r'href="[^"]{10,}"', block)
+            if not fingerprints:
+                continue
+
+            for lang in ('es', 'de'):
+                lang_file = f"{base}.{lang}.{ext}"
+                if lang_file in fetched:
+                    lang_html = fetched[lang_file]["html"]
+                else:
+                    try:
+                        lf = portfolio.get_contents(lang_file, ref=read_ref)
+                        lang_html = lf.decoded_content.decode()
+                        fetched[lang_file] = {"html": lang_html}
+                    except Exception:
+                        continue
+
+                # Check if fingerprint appears outside comments in the translation
+                lang_uncommented = re.sub(r'<!--.*?-->', '', lang_html, flags=re.DOTALL)
+                found_fp = next((fp for fp in fingerprints if fp in lang_uncommented), None)
+                if found_fp is None:
+                    continue
+
+                sep = "-" * 60
+                print(f"\n  ⚠️  {lang_file}: block is commented in EN but present in translation")
+                en_visible = [l.strip() for l in re.sub(r'<[^>]+>', '', block).splitlines() if l.strip()]
+                print(f"  EN (commented out)  {sep}")
+                for line in en_visible:
+                    print(f"    {line}")
+
+                bounds = _element_bounds(lang_html, found_fp)
+                if bounds:
+                    lang_visible = [
+                        l.strip() for l in
+                        re.sub(r'<[^>]+>', '', lang_html[bounds[0]:bounds[1]]).splitlines()
+                        if l.strip()
+                    ]
+                    print(f"  {lang.upper()} (uncommented)  {sep}")
+                    for line in lang_visible:
+                        print(f"    {line}")
+                print(sep)
+
+                choice = input(f"    Remove from {lang_file}? [y/n] ").strip().lower()
+                if choice != 'y':
+                    continue
+
+                if bounds:
+                    start, end = bounds
+                    # Also eat the surrounding newline/whitespace
+                    while start > 0 and lang_html[start - 1] in ' \t':
+                        start -= 1
+                    if start > 0 and lang_html[start - 1] == '\n':
+                        start -= 1
+                    new_html = lang_html[:start] + lang_html[end:]
+                    fetched[lang_file]["html"] = new_html
+                    if lang_file not in changed:
+                        changed.append(lang_file)
+                    print(f"    ✅ Removed from {lang_file}")
+                else:
+                    print("    ⚠️  Could not locate element bounds — skipping automatic removal.")
+
+    if not changed:
+        print("    ✅ No commented-out drift found")
+    return changed
+
+
+# ── Phase runners ─────────────────────────────────────────────────────────────
+
+def _phase_header(n: int, title: str) -> None:
+    print(f"\n{'═' * 60}")
+    print(f"  Phase {n}: {title}")
+    print(f"{'═' * 60}")
+
+
+def _list_en_pages(portfolio, read_ref: str) -> list[str]:
+    """Return all EN HTML pages in the portfolio root (excludes 404.html and lang variants)."""
+    try:
+        items = portfolio.get_contents("", ref=read_ref)
+        return [
+            f.name for f in items
+            if f.name.endswith(".html")
+            and not re.search(r'\.(es|de)\.html$', f.name)
+            and f.name not in {"404.html"}
+        ]
+    except Exception as e:
+        print(f"  ⚠️  Could not list repo contents: {e}")
+        return [PORTFOLIO_FILE]
+
+
+def run_phase_1(g: Github, llm: ChatAnthropic, portfolio, fetched: dict, read_ref: str) -> list[str]:
+    """Phase 1: English baseline & repo check — links and card content."""
+    _phase_header(1, "English Baseline & Repo Check")
+    changed = []
+    print("\n🔗 Checking links...")
+    changed += _fix_links_inplace(g, fetched)
+    print("\n⚙️  Checking card content (tech stack + description)...")
+    changed += _fix_card_content_inplace(g, llm, fetched)
+    return changed
+
+
+def run_phase_2(portfolio, fetched: dict, read_ref: str) -> list[str]:
+    """Phase 2: HTML structure consistency — styling, card order, and commented-block drift."""
+    _phase_header(2, "HTML Structure Consistency")
+    changed = []
+    print("\n🎨 Checking styling...")
+    changed += _fix_styling_inplace(fetched)
+    print("\n🔀 Checking card order...")
+    changed += _fix_order_inplace(fetched)
+    print("\n🔍 Checking commented-out block drift in translations...")
+    changed += _fix_commented_blocks_inplace(portfolio, fetched, read_ref)
+    return changed
+
+
+def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
+    """Phase 3: Translation content review — missing or outdated translated sections."""
+    from sync_translations import _sync_file
+    _phase_header(3, "Translation Content Review")
+    en_pages = _list_en_pages(portfolio, read_ref)
+    changed = []
+    for en_file in en_pages:
+        print(f"\n  📄 {en_file}")
+        updates = _sync_file(llm, portfolio, en_file, read_ref)
+        for fname, html in updates.items():
+            if fname in fetched:
+                fetched[fname]["html"] = html
+            else:
+                fetched[fname] = {"html": html, "sha": ""}
+            if fname not in changed:
+                changed.append(fname)
+    return changed
+
+
+# ── Main menu ─────────────────────────────────────────────────────────────────
 
 def main():
     g = Github(auth=Auth.Token(os.getenv("GITHUB_TOKEN")))
@@ -541,27 +757,58 @@ def main():
     )
 
     portfolio, fetched, read_ref, open_audit_pr = _open_fix_session(g)
-    all_changed = set()
+    all_changed: set[str] = set()
 
-    print("🔗 Checking links...")
-    all_changed.update(_fix_links_inplace(g, fetched))
+    PHASES = [
+        ("1", "English Baseline & Repo Check",
+         lambda: run_phase_1(g, llm, portfolio, fetched, read_ref)),
+        ("2", "HTML Structure Consistency",
+         lambda: run_phase_2(portfolio, fetched, read_ref)),
+        ("3", "Translation Content Review",
+         lambda: run_phase_3(llm, portfolio, fetched, read_ref)),
+    ]
 
-    print("\n🎨 Checking styling...")
-    all_changed.update(_fix_styling_inplace(fetched))
+    while True:
+        print("\n" + "═" * 60)
+        print("  Portfolio Audit")
+        print("─" * 60)
+        for key, label, _ in PHASES:
+            print(f"  {key}. {label}")
+        print("  a. Run all phases")
+        print("  q. Quit / commit pending changes")
+        print("═" * 60)
+        choice = input("  Select: ").strip().lower()
 
-    print("\n🔀 Checking card order...")
-    all_changed.update(_fix_order_inplace(fetched))
+        if choice == "q":
+            break
 
-    print("\n⚙️  Checking card content (tech stack + description)...")
-    all_changed.update(_fix_card_content_inplace(g, llm, fetched))
+        if choice == "a":
+            keys_to_run = [key for key, _, _ in PHASES]
+        elif any(choice == key for key, _, _ in PHASES):
+            keys_to_run = [choice]
+        else:
+            print("  Invalid choice.")
+            continue
+
+        phase_map = {key: (label, fn) for key, label, fn in PHASES}
+        for i, key in enumerate(keys_to_run):
+            label, run_fn = phase_map[key]
+            changed = run_fn()
+            all_changed.update(changed)
+            # Offer to continue to the next phase when running sequentially
+            if i < len(keys_to_run) - 1:
+                cont = input("\n  ▶  Continue to next phase? [y/n] ").strip().lower()
+                if cont != "y":
+                    print("  Stopped. Return to the menu to run remaining phases.")
+                    break
 
     if not all_changed:
-        print("\n✅ All cards are up to date. Nothing to commit.")
+        print("\n✅ Nothing changed. No PR needed.")
         return
 
     changed_list = sorted(all_changed)
     print(f"\n{len(changed_list)} file(s) updated: {', '.join(changed_list)}")
-    confirm = input("Push changes to PR? [y/N] ").strip().lower()
+    confirm = input("\nPush changes to PR? [y/N] ").strip().lower()
     if confirm != "y":
         print("Aborted.")
         return
@@ -574,21 +821,28 @@ def main():
         open_audit_pr=open_audit_pr,
         branch_prefix="update-cards",
         commit_msg=(
-            "chore: audit pass — update stale portfolio cards\n\n"
+            "chore: audit pass — update portfolio\n\n"
             "- fix stale/transferred GitHub links\n"
+            "- update tech stack subtitles where languages/topics changed\n"
+            "- refresh description paragraphs where README has drifted\n"
             "- normalize Tailwind CSS classes within cards\n"
             "- reorder ES/DE cards to match EN\n"
-            "- update tech stack subtitles where languages/topics changed\n"
-            "- refresh description paragraphs where README has drifted"
+            "- remove blocks commented-out in EN but present in translations\n"
+            "- add missing translated sections"
         ),
-        pr_title="Update portfolio cards",
+        pr_title="Portfolio audit",
         pr_body=(
             "Automated audit pass — applied the following fixes as needed:\n\n"
+            "**Phase 1 — English Baseline & Repo Check**\n"
             "- Corrected transferred/stale repo URLs\n"
+            "- Updated tech stack subtitles\n"
+            "- Refreshed description paragraphs and bullets\n\n"
+            "**Phase 2 — HTML Structure Consistency**\n"
             "- Normalized Tailwind CSS class strings\n"
             "- Reordered ES/DE cards to match EN\n"
-            "- Updated tech stack subtitles\n"
-            "- Refreshed description paragraphs and bullets"
+            "- Removed commented-out blocks from translations\n\n"
+            "**Phase 3 — Translation Content Review**\n"
+            "- Added missing translated sections"
         ),
     )
     print(f"\n✅ PR: {pr_url}")

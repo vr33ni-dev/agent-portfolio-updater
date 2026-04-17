@@ -12,6 +12,12 @@ from audit import (
     _card_repo_paths,
     extract_repo_links,
     _fix_card_content_inplace,
+    _element_bounds,
+    _fix_commented_blocks_inplace,
+    _list_en_pages,
+    run_phase_1,
+    run_phase_2,
+    run_phase_3,
 )
 from sync_translations import (
     _split_sections,
@@ -327,3 +333,288 @@ def test_sync_file_in_sync():
 
     assert updates == {}
     llm.invoke.assert_not_called()
+
+
+# ── Unit tests: _element_bounds ───────────────────────────────────────────────
+
+def test_element_bounds_simple_div():
+    # _element_bounds resolves the innermost element containing the fingerprint
+    html = '<p>before</p><div class="foo"><span>hello</span></div><p>after</p>'
+    result = _element_bounds(html, 'hello')
+    assert result is not None
+    start, end = result
+    assert html[start:end] == '<span>hello</span>'
+
+
+def test_element_bounds_nested():
+    html = '<div id="outer"><div id="inner">target</div></div>'
+    result = _element_bounds(html, 'target')
+    assert result is not None
+    start, end = result
+    extracted = html[start:end]
+    assert 'target' in extracted
+    assert extracted.startswith('<div')
+
+
+def test_element_bounds_not_found():
+    html = '<div>nothing here</div>'
+    assert _element_bounds(html, 'missing') is None
+
+
+def test_element_bounds_self_closing_sibling():
+    html = '<section><img src="x.png"/><p>content</p></section>'
+    result = _element_bounds(html, 'content')
+    assert result is not None
+    start, end = result
+    assert html[start:end] == '<p>content</p>'
+
+
+# ── Unit tests: _fix_commented_blocks_inplace ─────────────────────────────────
+
+def _make_portfolio_mock(en_filename: str, en_html: str, lang_files: dict):
+    """Build a portfolio mock that returns HTML for specific filenames."""
+    portfolio = MagicMock()
+
+    def get_contents(path, ref=None):
+        contents = {en_filename: en_html, **lang_files}
+        if path == "":
+            # repo root listing
+            items = []
+            for name in contents:
+                m = MagicMock()
+                m.name = name
+                items.append(m)
+            return items
+        if path in contents:
+            f = MagicMock()
+            f.decoded_content = contents[path].encode()
+            return f
+        raise Exception(f"not found: {path}")
+
+    portfolio.get_contents.side_effect = get_contents
+    return portfolio
+
+
+@patch("builtins.input", return_value="y")
+def test_commented_block_drift_removed(mock_input):
+    """Block commented-out in EN but present in ES should be flagged and removed."""
+    block_content = (
+        '<div class="promo">'
+        '<a href="https://example.com/long-enough-link">Click here</a>'
+        '<p>Some promotional text that is quite long enough to be significant.</p>'
+        '</div>'
+    )
+    en_html = f'<main><!-- {block_content} --><p>keep this</p></main>'
+    es_html = f'<main>{block_content}<p>keep this</p></main>'
+
+    portfolio = _make_portfolio_mock("about.html", en_html, {"about.es.html": es_html})
+    fetched = {
+        "about.html": {"html": en_html, "sha": "aaa"},
+        "about.es.html": {"html": es_html, "sha": "bbb"},
+    }
+
+    changed = _fix_commented_blocks_inplace(portfolio, fetched, "main")
+
+    assert "about.es.html" in changed
+    assert block_content not in fetched["about.es.html"]["html"]
+    assert "keep this" in fetched["about.es.html"]["html"]
+
+
+@patch("builtins.input", return_value="n")
+def test_commented_block_drift_rejected(mock_input):
+    """When user rejects removal, the translation file should not be modified."""
+    block_content = (
+        '<div class="promo">'
+        '<a href="https://example.com/long-enough-link">Click here</a>'
+        '<p>Long enough promotional text for this test to be triggered.</p>'
+        '</div>'
+    )
+    en_html = f'<main><!-- {block_content} --><p>keep</p></main>'
+    es_html = f'<main>{block_content}<p>keep</p></main>'
+
+    portfolio = _make_portfolio_mock("about.html", en_html, {"about.es.html": es_html})
+    fetched = {
+        "about.html": {"html": en_html, "sha": "aaa"},
+        "about.es.html": {"html": es_html, "sha": "bbb"},
+    }
+
+    changed = _fix_commented_blocks_inplace(portfolio, fetched, "main")
+
+    assert changed == []
+    assert block_content in fetched["about.es.html"]["html"]
+
+
+def test_commented_block_no_drift():
+    """If a commented block has no uncommented counterpart in translations, nothing changes."""
+    comment_block = (
+        '<div class="promo">'
+        '<a href="https://example.com/long-enough-link">Click here</a>'
+        '<p>This is commented out in EN and also absent in ES.</p>'
+        '</div>'
+    )
+    en_html = f'<main><!-- {comment_block} --><p>keep</p></main>'
+    es_html = '<main><p>keep</p></main>'
+
+    portfolio = _make_portfolio_mock("about.html", en_html, {"about.es.html": es_html})
+    fetched = {
+        "about.html": {"html": en_html, "sha": "aaa"},
+        "about.es.html": {"html": es_html, "sha": "bbb"},
+    }
+
+    changed = _fix_commented_blocks_inplace(portfolio, fetched, "main")
+
+    assert changed == []
+
+
+def test_commented_block_skips_small_comments():
+    """Short comments (< 100 non-whitespace chars) should be ignored."""
+    en_html = '<main><!-- TODO: fix this --><p>keep</p></main>'
+    es_html = '<main><!-- TODO: fix this --><p>keep</p></main>'
+
+    portfolio = _make_portfolio_mock("about.html", en_html, {"about.es.html": es_html})
+    fetched = {
+        "about.html": {"html": en_html, "sha": "aaa"},
+        "about.es.html": {"html": es_html, "sha": "bbb"},
+    }
+
+    changed = _fix_commented_blocks_inplace(portfolio, fetched, "main")
+
+    assert changed == []
+
+
+# ── Unit tests: _list_en_pages ────────────────────────────────────────────────
+
+def _make_root_listing(*names):
+    """Create a portfolio mock whose root listing returns the given filenames."""
+    portfolio = MagicMock()
+    items = []
+    for name in names:
+        m = MagicMock()
+        m.name = name
+        items.append(m)
+    portfolio.get_contents.return_value = items
+    return portfolio
+
+
+def test_list_en_pages_filters_correctly():
+    """Only EN html pages should be returned; lang variants and 404 excluded."""
+    portfolio = _make_root_listing(
+        "index.html", "about.html", "work.html",
+        "index.es.html", "work.de.html",
+        "404.html", "style.css",
+    )
+    pages = _list_en_pages(portfolio, "main")
+    assert set(pages) == {"index.html", "about.html", "work.html"}
+
+
+def test_list_en_pages_fallback_on_error():
+    """If the API call fails, fall back to [PORTFOLIO_FILE] without raising."""
+    from audit import PORTFOLIO_FILE
+    portfolio = MagicMock()
+    portfolio.get_contents.side_effect = Exception("API error")
+    pages = _list_en_pages(portfolio, "main")
+    assert pages == [PORTFOLIO_FILE]
+
+
+# ── Integration tests: phase runners ─────────────────────────────────────────
+
+@patch("audit._fix_card_content_inplace", return_value=["work.html"])
+@patch("audit._fix_links_inplace", return_value=["work.html", "work.es.html"])
+def test_run_phase_1_returns_combined_changes(mock_links, mock_content):
+    """run_phase_1 should aggregate changed files from both link and content helpers."""
+    g = MagicMock()
+    llm = MagicMock()
+    portfolio = MagicMock()
+    fetched = _make_fetched(CARD_SINGLE)
+
+    changed = run_phase_1(g, llm, portfolio, fetched, "main")
+
+    assert "work.html" in changed
+    assert "work.es.html" in changed
+    mock_links.assert_called_once_with(g, fetched)
+    mock_content.assert_called_once_with(g, llm, fetched)
+
+
+@patch("audit._fix_card_content_inplace", return_value=[])
+@patch("audit._fix_links_inplace", return_value=[])
+def test_run_phase_1_no_changes(mock_links, mock_content):
+    """run_phase_1 returns an empty list when nothing changes."""
+    g = MagicMock()
+    llm = MagicMock()
+    portfolio = MagicMock()
+    fetched = _make_fetched(CARD_SINGLE)
+
+    changed = run_phase_1(g, llm, portfolio, fetched, "main")
+    assert changed == []
+
+
+@patch("audit._fix_commented_blocks_inplace", return_value=["work.es.html"])
+@patch("audit._fix_order_inplace", return_value=[])
+@patch("audit._fix_styling_inplace", return_value=["work.html"])
+def test_run_phase_2_returns_combined_changes(mock_style, mock_order, mock_drift):
+    """run_phase_2 should aggregate changed files from all three structure helpers."""
+    portfolio = MagicMock()
+    fetched = _make_fetched(CARD_SINGLE)
+
+    changed = run_phase_2(portfolio, fetched, "main")
+
+    assert "work.html" in changed
+    assert "work.es.html" in changed
+    mock_style.assert_called_once_with(fetched)
+    mock_order.assert_called_once_with(fetched)
+    mock_drift.assert_called_once_with(portfolio, fetched, "main")
+
+
+@patch("audit._fix_commented_blocks_inplace", return_value=[])
+@patch("audit._fix_order_inplace", return_value=[])
+@patch("audit._fix_styling_inplace", return_value=[])
+def test_run_phase_2_no_changes(mock_style, mock_order, mock_drift):
+    """run_phase_2 returns an empty list when all structure checks are clean."""
+    changed = run_phase_2(MagicMock(), _make_fetched(CARD_SINGLE), "main")
+    assert changed == []
+
+
+def test_run_phase_3_populates_fetched_and_returns_changed():
+    """run_phase_3 should call _sync_file for each EN page and record updated files."""
+    translated_html = "<section><h2>Über mich</h2><p>Ich bin Entwicklerin.</p></section>"
+
+    # Portfolio root lists two EN pages
+    root_items = []
+    for name in ("index.html", "about.html"):
+        m = MagicMock()
+        m.name = name
+        root_items.append(m)
+    portfolio = MagicMock()
+    portfolio.get_contents.return_value = root_items
+
+    llm = MagicMock()
+    fetched = {}
+
+    with patch(
+        "sync_translations._sync_file",
+        side_effect=[
+            {},                                          # index.html — in sync
+            {"about.de.html": translated_html},          # about.html — one section added
+        ],
+    ) as mock_sync:
+        changed = run_phase_3(llm, portfolio, fetched, "main")
+
+    assert "about.de.html" in changed
+    assert fetched["about.de.html"]["html"] == translated_html
+    assert mock_sync.call_count == 2
+
+
+def test_run_phase_3_no_changes():
+    """run_phase_3 returns empty list when all translations are in sync."""
+    root_items = []
+    for name in ("index.html",):
+        m = MagicMock()
+        m.name = name
+        root_items.append(m)
+    portfolio = MagicMock()
+    portfolio.get_contents.return_value = root_items
+
+    with patch("sync_translations._sync_file", return_value={}):
+        changed = run_phase_3(MagicMock(), portfolio, {}, "main")
+
+    assert changed == []

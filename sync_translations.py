@@ -70,8 +70,27 @@ def _section_anchor(section: str) -> str | None:
     return None
 
 
+def _strip_front_matter(html: str) -> tuple[str, str]:
+    """Return (front_matter_block, rest_of_html). front_matter_block is '' if none present."""
+    m = re.match(r'^(---\n.*?\n---\n?)', html, re.DOTALL)
+    if m:
+        return m.group(1), html[m.end():]
+    return "", html
+
+
 def _visible_text(html: str) -> str:
     return re.sub(r'<[^>]+>', '', html).strip()
+
+
+def _print_visible(html: str, indent: str = "  ") -> None:
+    """Print each non-empty visible text node on its own line."""
+    # Insert a newline before every opening tag so text from adjacent
+    # elements (e.g. <h2>Title</h2><p>body</p>) ends up on separate lines.
+    spaced = re.sub(r'<(?!/)', '\n<', html)
+    for line in re.sub(r'<[^>]+>', '', spaced).splitlines():
+        line = line.strip()
+        if line:
+            print(f"{indent}{line}")
 
 
 # ── Translation ───────────────────────────────────────────────────────────────
@@ -80,12 +99,19 @@ def _translate(llm: ChatAnthropic, section: str, lang: str) -> str:
     lang_label = {"es": "Spanish", "de": "German"}[lang]
     # Cap section size to avoid oversized requests during API load spikes
     section_trimmed = section[:8000] if len(section) > 8000 else section
+    formality = (
+        "Use formal address throughout (usted, not tú)." if lang == "es"
+        else "Use formal address throughout (Sie, not du)."
+    )
     prompt = (
         f'Translate the visible text in the following HTML into {lang_label}.\n\n'
         f'Rules:\n'
         f'- Preserve ALL HTML tags, attributes, class names, href and src values EXACTLY.\n'
         f'- Keep technical terms, tool names, and proper nouns in English '
         f'(e.g. "Python", "FastAPI", "GitHub", "Docker").\n'
+        f'- Also keep these words in English (do not translate): '
+        f'"cloud", "cloud platforms", "third-party APIs", "bugs".\n'
+        f'- {formality}\n'
         f'- Return only the HTML. No markdown, no backticks, no explanation.\n\n'
         f'{section_trimmed}'
     )
@@ -118,8 +144,12 @@ def _sync_file(llm: ChatAnthropic, portfolio, en_filename: str, ref: str) -> dic
         print(f"  Could not read {en_filename}: {e}")
         return {}
 
-    en_sections = _split_sections(en_html)
-    en_anchors = {_section_anchor(s): i for i, s in enumerate(en_sections) if _section_anchor(s)}
+    _en_front_matter, en_body = _strip_front_matter(en_html)
+    en_sections = _split_sections(en_body)
+    # Index 0 is always the preamble; skip it — the lang file already has its own preamble.
+    # For work pages, use stable anchor matching (GitHub URLs) so new cards are detected
+    # regardless of position. For all other pages, match purely by position.
+    is_work_page = '<div class="bg-white' in en_body
 
     updates: dict[str, str] = {}
 
@@ -129,18 +159,30 @@ def _sync_file(llm: ChatAnthropic, portfolio, en_filename: str, ref: str) -> dic
 
         try:
             lang_html = portfolio.get_contents(lang_file, ref=ref).decoded_content.decode()
-            lang_sections = _split_sections(lang_html)
+            lang_front_matter, lang_body = _strip_front_matter(lang_html)
+            lang_sections = _split_sections(lang_body)
             lang_anchors = {_section_anchor(s) for s in lang_sections if _section_anchor(s)}
         except Exception:
             print(f"\n  {lang_file} does not exist yet -- will create it")
-            lang_sections = list(en_sections)
+            lang_front_matter = ""
+            lang_sections = _split_sections(en_body)
             lang_anchors = set()
 
-        missing = [
-            (anchor, idx)
-            for anchor, idx in en_anchors.items()
-            if anchor not in lang_anchors
-        ]
+        if is_work_page:
+            # Match cards by stable anchor (GitHub URL or id attribute)
+            en_anchors = {_section_anchor(s): i for i, s in enumerate(en_sections) if i > 0 and _section_anchor(s)}
+            missing = [
+                (anchor, idx)
+                for anchor, idx in en_anchors.items()
+                if anchor not in lang_anchors
+            ]
+        else:
+            # Match sections by position — EN section i corresponds to lang section i
+            missing = [
+                (_section_anchor(en_sections[i]) or f"section {i}", i)
+                for i in range(1, len(en_sections))
+                if i >= len(lang_sections)
+            ]
 
         if not missing:
             print(f"  {lang_file} -- in sync, nothing to add")
@@ -150,41 +192,86 @@ def _sync_file(llm: ChatAnthropic, portfolio, en_filename: str, ref: str) -> dic
 
         working = list(lang_sections)
         any_accepted = False
+        # Stack of (insert_position,) for single-step undo support
+        undo_stack: list[int] = []
 
-        for anchor, en_idx in missing:
+        sep = "-" * 60
+        i = 0
+        while i < len(missing):
+            anchor, en_idx = missing[i]
             en_section = en_sections[en_idx]
             print(f"\n    Missing section: {anchor}")
 
             translated = _translate(llm, en_section, lang)
 
-            sep = "-" * 60
-            print(f"\n{sep}")
-            print(_visible_text(translated))
+            print(f"\n  EN  {sep}")
+            _print_visible(en_section)
+            print(f"  {lang.upper()}  {sep}")
+            _print_visible(translated)
             print(sep)
 
-            choice = input(f"    Add to {lang_file}? [y/n/improve] ").strip().lower()
+            choice = input(f"    Add to {lang_file}? [y/n/improve/back] ").strip().lower()
+
+            if choice == "back":
+                if undo_stack:
+                    pos = undo_stack.pop()
+                    working.pop(pos)
+                    any_accepted = len(undo_stack) > 0
+                    i = max(0, i - 1)
+                    print("    Undone. Re-reviewing previous section.")
+                else:
+                    print("    Nothing to go back to.")
+                continue
 
             if choice == "n":
+                i += 1
                 continue
-            if choice == "improve":
+
+            while choice == "improve":
                 feedback = input("    What to change: ").strip()
+                formality_note = (
+                    "Use formal address (usted, not tú)." if lang == "es"
+                    else "Use formal address (Sie, not du)."
+                )
                 translated = llm.invoke(
                     f'Improve this {lang_label} HTML translation based on the feedback.\n\n'
                     f'Translation:\n{translated}\n\n'
                     f'Feedback: {feedback}\n\n'
+                    f'Note: {formality_note} '
+                    f'Keep these words in English: "cloud", "cloud platforms", "third-party APIs", "bugs".\n\n'
                     f'Return only the updated HTML. No markdown, no backticks.'
                 ).content.strip()
                 translated = re.sub(r'^```[a-zA-Z]*\n?', '', translated).rstrip('`').strip()
-                print(f"\n{sep}")
-                print(_visible_text(translated))
+                print(f"\n  EN  {sep}")
+                _print_visible(en_section)
+                print(f"  {lang.upper()}  {sep}")
+                _print_visible(translated)
                 print(sep)
+                choice = input(f"    Add to {lang_file}? [y/n/improve/back] ").strip().lower()
+
+            if choice == "back":
+                if undo_stack:
+                    pos = undo_stack.pop()
+                    working.pop(pos)
+                    any_accepted = len(undo_stack) > 0
+                    i = max(0, i - 1)
+                    print("    Undone. Re-reviewing previous section.")
+                else:
+                    print("    Nothing to go back to.")
+                continue
+
+            if choice == "n":
+                i += 1
+                continue
 
             insert_at = min(en_idx, len(working))
             working.insert(insert_at, translated + "\n")
+            undo_stack.append(insert_at)
             any_accepted = True
+            i += 1
 
         if any_accepted:
-            updates[lang_file] = "".join(working)
+            updates[lang_file] = lang_front_matter + "".join(working)
 
     return updates
 
@@ -233,7 +320,8 @@ def _commit_and_pr(portfolio, all_updates: dict[str, str]) -> str | None:
     try:
         pr.create_review_request(reviewers=[PR_REVIEWER])
     except Exception as e:
-        print(f"  Could not add reviewer: {e}")
+        if "review cannot be requested from pull request author" not in str(e).lower():
+            print(f"  Could not add reviewer: {e}")
 
     return pr.html_url
 

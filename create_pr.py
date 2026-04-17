@@ -85,7 +85,8 @@ def create_pr(state: PortfolioState) -> dict:
     try:
         pr.create_review_request(reviewers=[PR_REVIEWER])
     except Exception as e:
-        print(f"⚠️  Could not add reviewer: {e}")
+        if "review cannot be requested from pull request author" not in str(e).lower():
+            print(f"⚠️  Could not add reviewer: {e}")
 
     print(f"\n✅ PR created: {pr.html_url}")
     return {"pr_url": pr.html_url}
