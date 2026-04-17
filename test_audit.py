@@ -14,6 +14,7 @@ from audit import (
     _fix_card_content_inplace,
     _element_bounds,
     _fix_commented_blocks_inplace,
+    _fix_structure_inplace,
     _list_en_pages,
     run_phase_1,
     run_phase_2,
@@ -551,8 +552,9 @@ def test_run_phase_1_no_changes(mock_links, mock_content):
 @patch("audit._fix_commented_blocks_inplace", return_value=["work.es.html"])
 @patch("audit._fix_order_inplace", return_value=[])
 @patch("audit._fix_styling_inplace", return_value=["work.html"])
-def test_run_phase_2_returns_combined_changes(mock_style, mock_order, mock_drift):
-    """run_phase_2 should aggregate changed files from all three structure helpers."""
+@patch("audit._fix_structure_inplace", return_value=[])
+def test_run_phase_2_returns_combined_changes(mock_struct, mock_style, mock_order, mock_drift):
+    """run_phase_2 should aggregate changed files from all four structure helpers."""
     portfolio = MagicMock()
     fetched = _make_fetched(CARD_SINGLE)
 
@@ -562,13 +564,15 @@ def test_run_phase_2_returns_combined_changes(mock_style, mock_order, mock_drift
     assert "work.es.html" in changed
     mock_style.assert_called_once_with(fetched)
     mock_order.assert_called_once_with(fetched)
+    mock_struct.assert_called_once_with(fetched)
     mock_drift.assert_called_once_with(portfolio, fetched, "main")
 
 
 @patch("audit._fix_commented_blocks_inplace", return_value=[])
 @patch("audit._fix_order_inplace", return_value=[])
 @patch("audit._fix_styling_inplace", return_value=[])
-def test_run_phase_2_no_changes(mock_style, mock_order, mock_drift):
+@patch("audit._fix_structure_inplace", return_value=[])
+def test_run_phase_2_no_changes(mock_struct, mock_style, mock_order, mock_drift):
     """run_phase_2 returns an empty list when all structure checks are clean."""
     changed = run_phase_2(MagicMock(), _make_fetched(CARD_SINGLE), "main")
     assert changed == []
@@ -616,5 +620,117 @@ def test_run_phase_3_no_changes():
 
     with patch("sync_translations._sync_file", return_value={}):
         changed = run_phase_3(MagicMock(), portfolio, {}, "main")
+
+    assert changed == []
+
+
+# ── Unit tests: _fix_structure_inplace ────────────────────────────────────────
+
+_CARD_EN_WITH_EXTRA = """\
+<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">
+  <h2 class="text-xl font-semibold mb-2">My Project</h2>
+  <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Python · FastAPI</p>
+  <p class="mb-4">A REST API.</p>
+  <ul class="list-disc list-inside text-sm mb-4 space-y-1">
+    <li>Feature A</li>
+    <li>Feature B</li>
+  </ul>
+  <p class="mb-4">Extra paragraph added in EN.</p>
+  <a href="https://github.com/vr33ni/my-project">GitHub</a>
+</div>
+"""
+
+_CARD_LANG_WITHOUT_EXTRA = """\
+<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">
+  <h2 class="text-xl font-semibold mb-2">Mein Projekt</h2>
+  <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Python · FastAPI</p>
+  <p class="mb-4">Eine REST API.</p>
+  <ul class="list-disc list-inside text-sm mb-4 space-y-1">
+    <li>Feature A</li>
+    <li>Feature B</li>
+  </ul>
+  <a href="https://github.com/vr33ni/my-project">GitHub</a>
+</div>
+"""
+
+
+@patch("builtins.input", return_value="y")
+def test_fix_structure_copies_missing_element(mock_input):
+    """When EN has an extra <p> vs translation, user accepts → element is copied."""
+    preamble = "<section>\n"
+    fetched = {
+        "work.html":    {"html": preamble + _CARD_EN_WITH_EXTRA, "sha": "a"},
+        "work.es.html": {"html": preamble + _CARD_LANG_WITHOUT_EXTRA, "sha": "b"},
+        "work.de.html": {"html": preamble + _CARD_LANG_WITHOUT_EXTRA, "sha": "c"},
+    }
+
+    changed = _fix_structure_inplace(fetched)
+
+    assert "work.es.html" in changed
+    assert "work.de.html" in changed
+    assert "Extra paragraph added in EN." in fetched["work.es.html"]["html"]
+    assert "Extra paragraph added in EN." in fetched["work.de.html"]["html"]
+
+
+@patch("builtins.input", return_value="n")
+def test_fix_structure_respects_reject(mock_input):
+    """When user rejects, translations are not modified."""
+    preamble = "<section>\n"
+    original_es = preamble + _CARD_LANG_WITHOUT_EXTRA
+    fetched = {
+        "work.html":    {"html": preamble + _CARD_EN_WITH_EXTRA, "sha": "a"},
+        "work.es.html": {"html": original_es, "sha": "b"},
+        "work.de.html": {"html": preamble + _CARD_LANG_WITHOUT_EXTRA, "sha": "c"},
+    }
+
+    changed = _fix_structure_inplace(fetched)
+
+    assert changed == []
+    assert fetched["work.es.html"]["html"] == original_es
+
+
+def test_fix_structure_no_diff_returns_clean():
+    """When EN and translations have the same element counts, no changes are made."""
+    preamble = "<section>\n"
+    fetched = {
+        "work.html":    {"html": preamble + CARD_SINGLE, "sha": "a"},
+        "work.es.html": {"html": preamble + CARD_SINGLE, "sha": "b"},
+        "work.de.html": {"html": preamble + CARD_SINGLE, "sha": "c"},
+    }
+
+    changed = _fix_structure_inplace(fetched)
+
+    assert changed == []
+
+
+def test_fix_structure_ignores_commented_elements():
+    """Elements commented out in EN must not be counted as missing from translations."""
+    card_en_with_comment = """\
+<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">
+  <h2 class="text-xl font-semibold mb-2">My Project</h2>
+  <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Python · FastAPI</p>
+  <p class="mb-4">A REST API.</p>
+  <!--<p class="mb-4">Commented out paragraph.</p>-->
+  <ul class="list-disc list-inside text-sm mb-4 space-y-1"><li>F</li></ul>
+  <a href="https://github.com/vr33ni/my-project">GitHub</a>
+</div>
+"""
+    card_lang = """\
+<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">
+  <h2 class="text-xl font-semibold mb-2">Mein Projekt</h2>
+  <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Python · FastAPI</p>
+  <p class="mb-4">Eine REST API.</p>
+  <ul class="list-disc list-inside text-sm mb-4 space-y-1"><li>F</li></ul>
+  <a href="https://github.com/vr33ni/my-project">GitHub</a>
+</div>
+"""
+    preamble = "<section>\n"
+    fetched = {
+        "work.html":    {"html": preamble + card_en_with_comment, "sha": "a"},
+        "work.es.html": {"html": preamble + card_lang, "sha": "b"},
+        "work.de.html": {"html": preamble + card_lang, "sha": "c"},
+    }
+
+    changed = _fix_structure_inplace(fetched)
 
     assert changed == []

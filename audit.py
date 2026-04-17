@@ -8,6 +8,7 @@ Phase 1 — English Baseline & Repo Check:
 Phase 2 — HTML Structure Consistency:
   - Normalizes Tailwind CSS classes across all language files (no LLM)
   - Corrects card order in ES/DE to match EN (no LLM)
+  - Detects HTML elements present in EN cards but missing from translations (no LLM)
   - Removes blocks that are commented-out in EN but present in translations (no LLM)
 
 Phase 3 — Translation Content Review:
@@ -390,19 +391,138 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
 
         print(f"    STALE  {label}")
 
-        # ── Review tech stack ────────────────────────────────────────────
-        if new_tech is not None:
-            print(f"       Tech stack:")
-            print(f"         Current:  {current_tech}")
-            print(f"         Proposed: {new_tech}")
-            choice = input("         Accept? [y/n/edit] ").strip().lower()
-            if choice == "n":
-                new_tech = None
-            elif choice == "edit":
-                edited = input("         Enter your version: ").strip()
-                new_tech = edited if edited else None
+        _orig_new_tech = new_tech  # preserve original LLM proposal for back navigation
 
-        if new_tech is not None:
+        # ── Card-level loop: supports back from description → tech stack ─────
+        accepted_tech = None
+        accepted_desc = None
+
+        _restart = True
+        while _restart:
+            _restart = False
+            accepted_tech = None
+            _review_tech = _orig_new_tech
+
+            # ── Review tech stack ────────────────────────────────────────────
+            if _review_tech is not None:
+                while True:
+                    print(f"       Tech stack:")
+                    print(f"         Current:  {current_tech}")
+                    print(f"         Proposed: {_review_tech}")
+                    choice = input("         Accept? [y/n/edit/back] ").strip().lower()
+                    if choice in ("n", "back"):
+                        _review_tech = None
+                        break
+                    elif choice == "edit":
+                        feedback = input("         What to change: ").strip()
+                        if feedback:
+                            raw = llm.invoke(
+                                f'You proposed this tech stack for a portfolio card: "{_review_tech}"\n\n'
+                                f'The user provided this feedback: {feedback}\n\n'
+                                f'GitHub data:\n'
+                                f'  Languages: {languages_str}\n'
+                                f'  Topics: {topics_str}\n\n'
+                                f'Return only the revised tech stack string in the format '
+                                f'"Tech · Stack · Here" (3-5 items, technical names in English). '
+                                f'No explanation, no markdown, no HTML.'
+                            ).content.strip()
+                            _review_tech = raw if '<' not in raw else _review_tech
+                        continue
+                    else:
+                        accepted_tech = _review_tech
+                        break
+
+            # ── Review description ───────────────────────────────────────────
+            if needs_desc:
+                en_file_parts = re.split(r'(?=<div class="bg-white)', fetched["work.html"]["html"])
+                en_card_idx = next(
+                    (i for i, p in enumerate(en_file_parts) if any(u in p for u in card_urls)),
+                    None,
+                )
+                if en_card_idx is None:
+                    break
+
+                def _generate_desc(card_chunk, feedback_hint=""):
+                    extra = f'\nFeedback to address: {feedback_hint}\n' if feedback_hint else ''
+                    return llm.invoke(
+                        f'Rewrite ONLY the description paragraph and bullet list for this portfolio card.\n\n'
+                        f'Current card:\n{card_chunk}\n\n'
+                        f'READMEs:\n{readme_str[:2500]}\n\n'
+                        f'Code context:\n{code_str[:1500]}\n\n'
+                        f'Rules:\n'
+                        f'- Keep the project name heading, tech subtitle, and GitHub link(s) EXACTLY as-is.\n'
+                        f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
+                        f'- Description: 2-3 sentences. Bullets: 2-3 items.\n'
+                        f'- Write in English.\n'
+                        f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
+                        f'{extra}'
+                    ).content.strip()
+
+                def _critique_desc(card_chunk):
+                    response = llm.invoke(
+                        f'You are reviewing a rewritten portfolio project card.\n\n'
+                        f'Evaluate against these criteria:\n'
+                        f'1. Accuracy — correctly reflects the repo(s) purpose and tech stack\n'
+                        f'2. Length — description 2-3 sentences, 2-3 bullet points (not more)\n'
+                        f'3. No raw README copy — must be a concise portfolio write-up\n'
+                        f'4. Structure — uses correct Tailwind CSS classes\n\n'
+                        f'READMEs:\n{readme_str[:2000]}\n\n'
+                        f'Code context:\n{code_str[:1000]}\n\n'
+                        f'CARD:\n{card_chunk}\n\n'
+                        f'Respond with exactly two lines:\n'
+                        f'Line 1: APPROVED or REJECTED\n'
+                        f'Line 2: If REJECTED, one concise sentence of specific feedback. '
+                        f'If APPROVED, write "Looks good."'
+                    ).content.strip()
+                    lines = response.splitlines()
+                    verdict = lines[0].strip().upper()
+                    feedback_msg = lines[1].strip() if len(lines) > 1 else ""
+                    return verdict, feedback_msg
+
+                en_new_card = _generate_desc(en_file_parts[en_card_idx])
+                for _attempt in range(3):
+                    verdict, critique_fb = _critique_desc(en_new_card)
+                    if verdict == "APPROVED":
+                        print(f"       ✅ Critique approved (attempt {_attempt + 1})")
+                        break
+                    print(f"       🔁 Critique retry {_attempt + 1}/3: {critique_fb}")
+                    en_new_card = _generate_desc(en_file_parts[en_card_idx], feedback_hint=critique_fb)
+
+                sep = "─" * 60
+                print(f"       Description:")
+                back_opt = "/back" if _orig_new_tech is not None else ""
+                print(f"\n{sep}")
+                print(_card_to_text(en_new_card))
+                print(sep)
+                while True:
+                    choice = input(f"         Accept? [y/n/improve{back_opt}] ").strip().lower()
+                    if choice == "back" and _orig_new_tech is not None:
+                        _restart = True
+                        break
+                    elif choice == "n":
+                        en_new_card = None
+                        break
+                    elif choice == "improve":
+                        feedback = input("         What to change: ").strip()
+                        en_new_card = llm.invoke(
+                            f'Improve this portfolio card based on the user\'s feedback.\n\n'
+                            f'Card:\n{en_new_card}\n\n'
+                            f'Feedback: {feedback}\n\n'
+                            f'Return the FULL updated card HTML only. No markdown, no backticks.'
+                        ).content.strip()
+                        print(f"\n{sep}")
+                        print(_card_to_text(en_new_card))
+                        print(sep)
+                        continue
+                    else:
+                        accepted_desc = en_new_card
+                        break
+
+                if _restart:
+                    continue  # restart card loop from tech stack
+
+        # ── Apply accepted changes ────────────────────────────────────────────
+        if accepted_tech is not None:
             for filename in PORTFOLIO_FILES:
                 old = fetched[filename]["html"]
                 file_parts = re.split(r'(?=<div class="bg-white)', old)
@@ -410,7 +530,7 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                 for part in file_parts:
                     if any(u in part for u in card_urls):
                         new_parts.append(TECH_P.sub(
-                            lambda m, t=new_tech: m.group(0).replace(m.group(1), t),
+                            lambda m, t=accepted_tech: m.group(0).replace(m.group(1), t),
                             part, count=1,
                         ))
                     else:
@@ -421,84 +541,14 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                     if filename not in changed:
                         changed.append(filename)
 
-        # ── Review description ───────────────────────────────────────────
-        if needs_desc:
+        if accepted_desc is not None:
             en_file_parts = re.split(r'(?=<div class="bg-white)', fetched["work.html"]["html"])
             en_card_idx = next(
                 (i for i, p in enumerate(en_file_parts) if any(u in p for u in card_urls)),
                 None,
             )
-            if en_card_idx is None:
-                continue
-
-            def _generate_desc(card_chunk, feedback_hint=""):
-                extra = f'\nFeedback to address: {feedback_hint}\n' if feedback_hint else ''
-                return llm.invoke(
-                    f'Rewrite ONLY the description paragraph and bullet list for this portfolio card.\n\n'
-                    f'Current card:\n{card_chunk}\n\n'
-                    f'READMEs:\n{readme_str[:2500]}\n\n'
-                    f'Code context:\n{code_str[:1500]}\n\n'
-                    f'Rules:\n'
-                    f'- Keep the project name heading, tech subtitle, and GitHub link(s) EXACTLY as-is.\n'
-                    f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
-                    f'- Description: 2-3 sentences. Bullets: 2-3 items.\n'
-                    f'- Write in English.\n'
-                    f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
-                    f'{extra}'
-                ).content.strip()
-
-            def _critique_desc(card_chunk):
-                response = llm.invoke(
-                    f'You are reviewing a rewritten portfolio project card.\n\n'
-                    f'Evaluate against these criteria:\n'
-                    f'1. Accuracy — correctly reflects the repo(s) purpose and tech stack\n'
-                    f'2. Length — description 2-3 sentences, 2-3 bullet points (not more)\n'
-                    f'3. No raw README copy — must be a concise portfolio write-up\n'
-                    f'4. Structure — uses correct Tailwind CSS classes\n\n'
-                    f'READMEs:\n{readme_str[:2000]}\n\n'
-                    f'Code context:\n{code_str[:1000]}\n\n'
-                    f'CARD:\n{card_chunk}\n\n'
-                    f'Respond with exactly two lines:\n'
-                    f'Line 1: APPROVED or REJECTED\n'
-                    f'Line 2: If REJECTED, one concise sentence of specific feedback. '
-                    f'If APPROVED, write "Looks good."'
-                ).content.strip()
-                lines = response.splitlines()
-                verdict = lines[0].strip().upper()
-                feedback_msg = lines[1].strip() if len(lines) > 1 else ""
-                return verdict, feedback_msg
-
-            en_new_card = _generate_desc(en_file_parts[en_card_idx])
-            for _attempt in range(3):
-                verdict, critique_fb = _critique_desc(en_new_card)
-                if verdict == "APPROVED":
-                    print(f"       ✅ Critique approved (attempt {_attempt + 1})")
-                    break
-                print(f"       🔁 Critique retry {_attempt + 1}/3: {critique_fb}")
-                en_new_card = _generate_desc(en_file_parts[en_card_idx], feedback_hint=critique_fb)
-
-            sep = "─" * 60
-            print(f"       Description:")
-            print(f"\n{sep}")
-            print(_card_to_text(en_new_card))
-            print(sep)
-            choice = input("         Accept? [y/n/improve] ").strip().lower()
-            if choice == "n":
-                en_new_card = None
-            elif choice == "improve":
-                feedback = input("         What to change: ").strip()
-                en_new_card = llm.invoke(
-                    f'Improve this portfolio card based on the user\'s feedback.\n\n'
-                    f'Card:\n{en_new_card}\n\n'
-                    f'Feedback: {feedback}\n\n'
-                    f'Return the FULL updated card HTML only. No markdown, no backticks.'
-                ).content.strip()
-                print(f"\n{sep}")
-                print(_card_to_text(en_new_card))
-                print(sep)
-
-            if en_new_card is not None:
-                en_file_parts[en_card_idx] = en_new_card + "\n"
+            if en_card_idx is not None:
+                en_file_parts[en_card_idx] = accepted_desc + "\n"
                 new_en = "".join(en_file_parts)
                 if new_en != fetched["work.html"]["html"]:
                     fetched["work.html"]["html"] = new_en
@@ -577,6 +627,120 @@ def _element_bounds(html: str, fingerprint: str) -> tuple[int, int] | None:
             pos = next_close + len(close)
     return tag_start, pos
 
+
+def _fix_structure_inplace(fetched: dict) -> list[str]:
+    """Detect HTML elements present in active EN cards but absent from matching translated cards.
+    HTML comments are stripped before comparison so commented-out EN content is ignored.
+    For <a> tags, missing links are identified by href.
+    For other structural tags, count differences are resolved by copying positional extras from EN.
+    Copies missing elements verbatim before the card's closing </div>.
+    Returns list of changed filenames."""
+    en_html = fetched["work.html"]["html"]
+    en_parts = re.split(r'(?=<div class="bg-white)', en_html)
+    changed = []
+
+    _TAGS = ("h2", "h3", "p", "ul", "a")
+
+    for en_card in en_parts:
+        card_urls = [
+            u.rstrip("/")
+            for u in re.findall(r'href="(https://github\.com/[^"]+)"', en_card)
+            if len(u.rstrip("/").split("/")) == 5
+        ]
+        if not card_urls:
+            continue
+
+        label = _card_label(en_card)
+        en_active = re.sub(r'<!--.*?-->', '', en_card, flags=re.DOTALL)
+
+        for filename in ("work.es.html", "work.de.html"):
+            lang_html = fetched[filename]["html"]
+            lang_parts = re.split(r'(?=<div class="bg-white)', lang_html)
+            card_idx = next(
+                (i for i, p in enumerate(lang_parts) if any(u in p for u in card_urls)),
+                None,
+            )
+            if card_idx is None:
+                continue
+
+            lang_card = lang_parts[card_idx]
+            lang_active = re.sub(r'<!--.*?-->', '', lang_card, flags=re.DOTALL)
+
+            # Collect the exact elements to be copied per tag
+            pending: list[tuple[str, str]] = []  # (tag, element_html)
+            for tag in _TAGS:
+                en_count = len(re.findall(rf'<{tag}[\s>]', en_active, re.IGNORECASE))
+                lang_count = len(re.findall(rf'<{tag}[\s>]', lang_active, re.IGNORECASE))
+                if en_count <= lang_count:
+                    continue
+                if tag == "a":
+                    en_hrefs = re.findall(r'<a[^>]+href="([^"]+)"', en_active, re.IGNORECASE)
+                    lang_hrefs = set(re.findall(r'<a[^>]+href="([^"]+)"', lang_active, re.IGNORECASE))
+                    for href in en_hrefs:
+                        if href in lang_hrefs:
+                            continue
+                        m = re.search(
+                            rf'(<a[^>]+{re.escape(href)}[^>]*>.*?</a>)',
+                            en_active, re.DOTALL | re.IGNORECASE,
+                        )
+                        if m:
+                            pending.append((tag, m.group(1)))
+                else:
+                    en_els = re.findall(
+                        rf'(<{tag}[\s>].*?</{tag}>)', en_active, re.DOTALL | re.IGNORECASE,
+                    )
+                    for extra in en_els[lang_count:]:
+                        pending.append((tag, extra))
+
+            if not pending:
+                continue
+
+            # Show what will be copied before asking
+            print(f"    ⚠️  {filename} | {label}: EN has {len(pending)} extra element(s):")
+            for tag, el_html in pending:
+                text = re.sub(r'<[^>]+>', ' ', el_html)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if tag == "a":
+                    href = (re.search(r'href="([^"]+)"', el_html) or MagicMock()).group(1) \
+                        if re.search(r'href="([^"]+)"', el_html) else ""
+                    preview = f"<a>  {text}  →  {href}"
+                elif tag == "ul":
+                    items = re.findall(r'<li[^>]*>(.*?)</li>', el_html, re.DOTALL | re.IGNORECASE)
+                    item_texts = [re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', i)).strip() for i in items]
+                    preview = f"<ul> {' / '.join(item_texts)}"
+                else:
+                    preview = f"<{tag}> {text[:120]}"
+                print(f"         {preview}")
+            choice = input("         Copy these into translation? [y/n] ").strip().lower()
+            if choice != "y":
+                continue
+
+            new_lang_card = lang_card
+            for tag, el_html in pending:
+                new_lang_card = _insert_before_card_close(new_lang_card, el_html)
+
+            if new_lang_card != lang_card:
+                lang_parts[card_idx] = new_lang_card
+                fetched[filename]["html"] = "".join(lang_parts)
+                if filename not in changed:
+                    changed.append(filename)
+                print(f"       ✅ Copied into {filename}")
+
+    if not changed:
+        print("    ✅ Element structure matches EN")
+    return changed
+
+
+def _insert_before_card_close(card_html: str, element: str) -> str:
+    """Insert element HTML before the last </div> in a card chunk."""
+    close = "</div>"
+    idx = card_html.rfind(close)
+    if idx == -1:
+        return card_html + "\n  " + element
+    return card_html[:idx] + "  " + element + "\n" + card_html[idx:]
+
+
+# ── Commented-block drift check ──────────────────────────────────────────────
 
 def _fix_commented_blocks_inplace(portfolio, fetched: dict, read_ref: str) -> list[str]:
     """Find blocks that are commented-out in EN but uncommented in translations.
@@ -715,9 +879,11 @@ def run_phase_1(g: Github, llm: ChatAnthropic, portfolio, fetched: dict, read_re
 
 
 def run_phase_2(portfolio, fetched: dict, read_ref: str) -> list[str]:
-    """Phase 2: HTML structure consistency — styling, card order, and commented-block drift."""
+    """Phase 2: HTML structure consistency — styling, card order, element structure, and commented-block drift."""
     _phase_header(2, "HTML Structure Consistency")
     changed = []
+    print("\n🔬 Checking element structure vs EN...")
+    changed += _fix_structure_inplace(fetched)
     print("\n🎨 Checking styling...")
     changed += _fix_styling_inplace(fetched)
     print("\n🔀 Checking card order...")
