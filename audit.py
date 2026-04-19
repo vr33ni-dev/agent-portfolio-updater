@@ -895,10 +895,12 @@ def run_phase_2(portfolio, fetched: dict, read_ref: str) -> list[str]:
 
 def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
     """Phase 3: Translation content review — missing or outdated translated sections."""
-    from sync_translations import _sync_file
+    from sync_translations import _sync_file, _split_sections, _lang_filename
     _phase_header(3, "Translation Content Review")
     en_pages = _list_en_pages(portfolio, read_ref)
     changed = []
+
+    # ── Section sync ─────────────────────────────────────────────────────────
     for en_file in en_pages:
         print(f"\n  📄 {en_file}")
         updates = _sync_file(llm, portfolio, en_file, read_ref)
@@ -909,7 +911,273 @@ def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
                 fetched[fname] = {"html": html, "sha": ""}
             if fname not in changed:
                 changed.append(fname)
+
+    # ── Collect all drift items up front ─────────────────────────────────────
+    print("\n  🔍 Checking translation drift...")
+    # Cards flagged for drift: (en_file, lang_file, card_idx, lang_card, lang, critique)
+    # card_idx lets us re-read en_card live from fetched so EN edits carry over across languages.
+    drift_items = []
+    for en_file in en_pages:
+        for lang in ("es", "de"):
+            lang_file = _lang_filename(en_file, lang)
+            if lang_file not in fetched or en_file not in fetched:
+                continue
+            en_sections = _split_sections(fetched[en_file]["html"])
+            lang_sections = _split_sections(fetched[lang_file]["html"])
+            for i in range(1, min(len(en_sections), len(lang_sections))):
+                en_card = en_sections[i]
+                lang_card = lang_sections[i]
+                if not re.search(r'\w', en_card) or not re.search(r'\w', lang_card):
+                    continue
+                critique = _llm_compare_translation(llm, en_card, lang_card, lang)
+                if critique:
+                    drift_items.append((en_file, lang_file, i, lang_card, lang, critique))
+
+    if not drift_items:
+        return changed
+
+    # ── Navigate drift items with back/forward ────────────────────────────────
+    idx = 0
+    while idx < len(drift_items):
+        en_file, lang_file, card_idx, lang_card, lang, critique = drift_items[idx]
+        # Re-read en_card fresh so any EN edits from a previous comparison are picked up
+        en_card = _split_sections(fetched[en_file]["html"])[card_idx]
+        label = _card_label(en_card) or f"card {idx + 1}"
+        # Re-evaluate drift with the current EN (may have been updated during an earlier review)
+        fresh_critique = _llm_compare_translation(llm, en_card, lang_card, lang)
+        if fresh_critique is None:
+            print(f"\n    ✅  {lang_file} — {label}: drift resolved (EN was updated earlier)")
+            idx += 1
+            continue
+        critique = fresh_critique
+        print(f"\n    ⚠️  {lang_file} — {label}: LLM flagged translation drift:")
+        print(f"      {critique.strip()}")
+        _print_card_summary(en_card, "EN")
+        _print_card_summary(lang_card, lang.upper())
+        result = _handle_drift_interactive(llm, en_file, lang_file, en_card, lang_card, lang, fetched, changed, card_idx, critique)
+        if result == "back" and idx > 0:
+            idx -= 1
+        else:
+            idx += 1
+
     return changed
+
+# ── Card summary printer ────────────────────────────────────────────────────
+def _print_card_summary(card_html: str, label: str) -> None:
+    """Print a structured summary of a card matching the HTML layout: headline, tech, description, bullets, link."""
+    ind = "      "
+    sep = f"{ind}{'─' * 44}"
+    print(sep)
+    print(f"{ind}{label}")
+
+    title_m = re.search(r'<h2[^>]*>(.*?)</h2>', card_html, re.DOTALL)
+    if title_m:
+        print(f"{ind}  {re.sub(r'<[^>]+>', '', title_m.group(1)).strip()}")
+
+    tech_m = TECH_P.search(card_html)
+    if tech_m:
+        print(f"{ind}  Tech:  {tech_m.group(1).strip()}")
+
+    desc_m = re.search(r'<p class="mb-4"[^>]*>(.*?)</p>', card_html, re.DOTALL)
+    if desc_m:
+        desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip()
+        print(f"{ind}  {desc}")
+
+    bullets = re.findall(r'<li[^>]*>(.*?)</li>', card_html, re.DOTALL)
+    for b in bullets:
+        print(f"{ind}  • {re.sub(r'<[^>]+>', '', b).strip()}")
+
+    link_m = re.search(r'href="(https://github\.com/[^"]+)"', card_html)
+    if link_m:
+        print(f"{ind}  {link_m.group(1)}")
+
+    print(sep)
+
+
+# ── Translation drift interactive fix ───────────────────────────────────────
+def _handle_drift_interactive(
+    llm, en_file: str, lang_file: str, en_card: str, lang_card: str, lang: str,
+    fetched: dict, changed: list, card_idx: int = -1, critique: str = "",
+) -> str | None:
+    """Prompt user to act on a flagged translation drift. Returns 'back' or None."""
+    lang_label = {"es": "Spanish", "de": "German"}[lang]
+    current_card = lang_card
+    en_ref = [en_card]  # mutable so EN updates propagate to retranslate
+
+    def _rewrite_en(instruction: str) -> str:
+        """Rewrite the EN card using the given instruction, update fetched and en_ref."""
+        from sync_translations import _split_sections
+        new_en = llm.invoke(
+            f"Update the following English portfolio card according to this instruction:\n{instruction}\n\n"
+            f"Rules:\n"
+            f"- Preserve the exact HTML structure and Tailwind CSS classes.\n"
+            f"- Return ONLY the updated card HTML, no markdown, no backticks.\n\n"
+            f"CURRENT ENGLISH CARD:\n{en_ref[0]}\n"
+        ).content.strip()
+        en_ref[0] = new_en
+        if card_idx >= 0:
+            # Positional replace — reliable regardless of whitespace differences
+            sections = _split_sections(fetched[en_file]["html"])
+            sections[card_idx] = new_en
+            fetched[en_file]["html"] = "".join(sections)
+        else:
+            # Fallback: string replace (card_idx unavailable)
+            old_html = fetched[en_file]["html"]
+            fetched[en_file]["html"] = old_html.replace(en_card, new_en, 1)
+        if en_file not in changed:
+            changed.append(en_file)
+        print(f"      ✅  Updated EN card in {en_file}")
+        return new_en
+
+    def _discuss(concern: str) -> str:
+        """LLM responds to user's concern and shares its plan."""
+        response = llm.invoke(
+            f"You are helping review a {lang_label} translation of an English portfolio card.\n\n"
+            f"ENGLISH CARD:\n{en_ref[0]}\n\n"
+            f"CURRENT TRANSLATION:\n{current_card}\n\n"
+            f"The user raised this concern or question:\n{concern}\n\n"
+            f"First, answer their question directly and share your opinion. "
+            f"If the fix also requires updating the ENGLISH card, say so explicitly. "
+            f"Then describe what you would change (2-4 bullet points). "
+            f"Do NOT generate HTML."
+        ).content.strip()
+        return response
+
+    def _plan_improvement(card: str, hint: str = "") -> str:
+        """Ask LLM to describe what it would change, without generating HTML yet."""
+        extra = f"\nThe user's specific instruction: {hint}\n" if hint else ""
+        return llm.invoke(
+            f"You are reviewing a {lang_label} translation of an English portfolio card for semantic drift.\n"
+            f"{extra}\n"
+            f"ENGLISH CARD:\n{en_card}\n\n"
+            f"CURRENT TRANSLATION:\n{card}\n\n"
+            f"Describe concisely (2-4 bullet points) what you would change to fix the drift. "
+            f"Do NOT generate HTML yet — just explain your plan in plain text."
+        ).content.strip()
+
+    def _maybe_update_en(instruction: str) -> None:
+        """Rewrite EN card only if the user explicitly asks to update/fix/change the English card."""
+        en_keywords = ("update the english", "fix the english", "change the english",
+                       "update english card", "fix english card", "update the en card",
+                       "fix the en card", "update en card", "also update english",
+                       "also fix english", "en version", "english version", "english card")
+        if any(k in instruction.lower() for k in en_keywords):
+            _rewrite_en(instruction)
+
+    def _retranslate(card: str, feedback: str = "") -> str:
+        extra = f"\nUser feedback to address: {feedback}\n" if feedback else ""
+        return llm.invoke(
+            f"Retranslate the following English portfolio card into {lang_label}.\n"
+            f"Rules:\n"
+            f"- Keep all technical terms and technology names in English.\n"
+            f"- Preserve the exact HTML structure and Tailwind CSS classes.\n"
+            f"- Return ONLY the translated card HTML, no markdown, no backticks.\n"
+            f"{extra}\n"
+            f"ENGLISH CARD:\n{en_ref[0]}\n"
+        ).content.strip()
+
+    def _show_card(card: str) -> None:
+        _print_card_summary(en_ref[0], "EN")
+        _print_card_summary(card, lang.upper())
+
+    while True:
+        choice = input("      Fix? [y=retranslate / improve / n=skip / back] ").strip().lower()
+        if choice == "back":
+            return "back"
+        elif choice == "n":
+            return None
+        elif choice == "y":
+            current_card = _retranslate(en_ref[0], feedback=critique)
+        elif choice == "improve":
+            concern = input("      Your concern or question: ").strip()
+            response = _discuss(concern)
+            print()
+            for line in response.splitlines():
+                print(f"        {line}")
+            print()
+            direction = input("      [proceed / redirect / n=cancel] ").strip().lower()
+            if direction == "n":
+                return None
+            elif direction == "redirect":
+                concern = input("      Your instruction: ").strip()
+                instruction = concern
+            else:
+                instruction = response
+            # Offer to update EN if the user's own words explicitly target it
+            _maybe_update_en(concern)
+            current_card = _retranslate(current_card, instruction)
+        else:
+            print("      Options: y  improve  n  back")
+            continue
+
+        # Show result and let user keep iterating
+        _show_card(current_card)
+        while True:
+            accept = input("      Apply? [y / improve / n / back] ").strip().lower()
+            if accept == "y":
+                break  # fall through to apply
+            elif accept == "n":
+                return None
+            elif accept == "back":
+                current_card = lang_card
+                break  # restart outer loop
+            elif accept == "improve":
+                concern = input("      Your concern or question: ").strip()
+                response = _discuss(concern)
+                print()
+                for line in response.splitlines():
+                    print(f"        {line}")
+                print()
+                direction = input("      [proceed / redirect / n=cancel] ").strip().lower()
+                if direction == "n":
+                    return None
+                elif direction == "redirect":
+                    concern = input("      Your instruction: ").strip()
+                    instruction = concern
+                else:
+                    instruction = response
+                # Offer to update EN if the user's own words explicitly target it
+                _maybe_update_en(concern)
+                current_card = _retranslate(current_card, instruction)
+                _show_card(current_card)
+            else:
+                print("      Options: y  improve  n  back")
+        if accept != "y":
+            continue  # restart outer loop (back was pressed)
+
+        # Apply the fixed card back into the file
+        lang_html = fetched[lang_file]["html"]
+        new_html = lang_html.replace(lang_card, current_card, 1)
+        if new_html != lang_html:
+            fetched[lang_file]["html"] = new_html
+            if lang_file not in changed:
+                changed.append(lang_file)
+            print(f"      ✅  Applied fix to {lang_file}")
+        return None
+
+
+# ── LLM-based translation drift check ───────────────────────────────────────
+def _llm_compare_translation(llm, en_card: str, lang_card: str, lang: str) -> str | None:
+    """Ask LLM to compare EN and translation card for semantic drift. Returns critique if drift found, else None."""
+    lang_label = {"es": "Spanish", "de": "German"}[lang]
+    prompt = (
+        f"Compare the following English and {lang_label} HTML portfolio cards.\n\n"
+        f"ENGLISH CARD:\n{en_card}\n\n"
+        f"{lang_label.upper()} CARD:\n{lang_card}\n\n"
+        f"Rules:\n"
+        f"- Check that all technologies, features, and details in the English card are present and accurate in the translation.\n"
+        f"- Flag any missing, added, or incorrect content.\n"
+        f"- If the translation is accurate, reply ONLY 'OK'.\n"
+        f"- If there is any drift, reply with a short critique (1-2 sentences, no markdown)."
+    )
+    try:
+        response = llm.invoke(prompt).content.strip()
+    except Exception as e:
+        print(f"      [LLM error: {e}]")
+        return None
+    if response.upper().startswith("OK"):
+        return None
+    return response
 
 
 # ── Main menu ─────────────────────────────────────────────────────────────────

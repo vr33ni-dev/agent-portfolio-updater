@@ -19,6 +19,7 @@ from audit import (
     run_phase_1,
     run_phase_2,
     run_phase_3,
+    _llm_compare_translation,
 )
 from sync_translations import (
     _split_sections,
@@ -734,3 +735,65 @@ def test_fix_structure_ignores_commented_elements():
     changed = _fix_structure_inplace(fetched)
 
     assert changed == []
+
+
+# ── Unit tests: _llm_compare_translation ─────────────────────────────────────
+
+def test_llm_compare_translation_ok():
+    """If LLM returns 'OK', helper returns None (no drift)."""
+    llm = MagicMock()
+    llm.invoke.return_value.content.strip.return_value = "OK"
+    en_card = CARD_SINGLE
+    lang_card = CARD_SINGLE.replace("Cool Project", "Proyecto Genial")
+    result = _llm_compare_translation(llm, en_card, lang_card, "es")
+    assert result is None
+
+
+def test_llm_compare_translation_drift():
+    """If LLM returns critique, helper returns it (drift detected)."""
+    llm = MagicMock()
+    llm.invoke.return_value.content.strip.return_value = "Tech stack is missing FastAPI."
+    en_card = CARD_SINGLE
+    lang_card = CARD_SINGLE.replace("FastAPI", "")
+    result = _llm_compare_translation(llm, en_card, lang_card, "es")
+    assert result == "Tech stack is missing FastAPI."
+
+
+def test_llm_compare_translation_handles_error():
+    """If LLM raises, helper returns None and prints error."""
+    llm = MagicMock()
+    llm.invoke.side_effect = Exception("API error")
+    en_card = CARD_SINGLE
+    lang_card = CARD_SINGLE
+    result = _llm_compare_translation(llm, en_card, lang_card, "es")
+    assert result is None
+
+
+# ── Integration test: drift and sync output ─────────────────────────────
+
+def test_phase3_drift_and_sync_output(capsys):
+    """Phase 3 should print both structure and semantic sync status, and show tech stack lines if drift."""
+    # Simulate EN and ES cards with a tech stack drift
+    en_card = CARD_SINGLE.replace("FastAPI", "FastAPI · Anthropic Claude")
+    lang_card = CARD_SINGLE.replace("FastAPI", "Anthropic API")
+    en_html = "<section>\n" + en_card
+    lang_html = "<section>\n" + lang_card
+    fetched = {
+        "work.html": {"html": en_html, "sha": "a"},
+        "work.es.html": {"html": lang_html, "sha": "b"},
+    }
+    portfolio = MagicMock()
+    portfolio.get_contents.return_value.decoded_content.decode.return_value = en_html
+    llm = MagicMock()
+    llm.invoke.return_value.content.strip.return_value = (
+        "The Spanish translation has a minor inconsistency in the technology stack: 'Anthropic Claude' in English becomes 'Anthropic API' in Spanish."
+    )
+    # Patch helpers to isolate the drift logic
+    with patch("audit._list_en_pages", return_value=["work.html"]), \
+         patch("sync_translations._sync_file", return_value={}), \
+         patch("sync_translations._split_sections", side_effect=lambda html: ["<section>\n", html]), \
+         patch("audit._handle_drift_interactive"):
+        run_phase_3(llm, portfolio, fetched, "main")
+    out = capsys.readouterr().out
+    assert "LLM flagged translation drift" in out
+    assert "Anthropic Claude" in out and "Anthropic API" in out

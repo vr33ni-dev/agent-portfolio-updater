@@ -185,7 +185,6 @@ def _sync_file(llm: ChatAnthropic, portfolio, en_filename: str, ref: str) -> dic
             ]
 
         if not missing:
-            print(f"  {lang_file} -- in sync, nothing to add")
             continue
 
         print(f"\n  {lang_file} -- {len(missing)} section(s) missing")

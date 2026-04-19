@@ -54,6 +54,19 @@ REWRITTEN_CARD = """\
 </div>
 """
 
+CARD_SINGLE = """\
+<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">
+  <h2 class="text-xl font-semibold mb-2">My Cool Project</h2>
+  <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Python · FastAPI</p>
+  <p class="mb-4">A tool that does stuff.</p>
+  <ul class="list-disc list-inside text-sm mb-4 space-y-1">
+    <li>Feature A</li>
+    <li>Feature B</li>
+  </ul>
+  <a href="https://github.com/vr33ni/my-cool-project">GitHub</a>
+</div>
+"""
+
 # ── Mocks ─────────────────────────────────────────────────────────────────────
 
 def _make_repo():
@@ -169,3 +182,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ── Simulate: drift and sync output ─────────────────────────────────────
+
+def simulate_phase3_drift_and_sync():
+    """Simulate Phase 3 output for a card with structure in sync but semantic drift."""
+    from audit import run_phase_3
+    from unittest.mock import MagicMock, patch
+    en_card = CARD_SINGLE.replace("FastAPI", "FastAPI · Anthropic Claude")
+    lang_card = CARD_SINGLE.replace("FastAPI", "Anthropic API")
+    en_html = "<section>\n" + en_card
+    lang_html = "<section>\n" + lang_card
+    fetched = {
+        "work.html": {"html": en_html, "sha": "a"},
+        "work.es.html": {"html": lang_html, "sha": "b"},
+    }
+    portfolio = MagicMock()
+    portfolio.get_contents.return_value.decoded_content.decode.return_value = en_html
+    llm = MagicMock()
+    llm.invoke.return_value.content.strip.return_value = (
+        "The Spanish translation has a minor inconsistency in the technology stack: 'Anthropic Claude' in English becomes 'Anthropic API' in Spanish."
+    )
+    with patch("sync_translations._split_sections", side_effect=lambda html: ["<section>\n", html]):
+        run_phase_3(llm, portfolio, fetched, "main")
+
+# To run: simulate_phase3_drift_and_sync()
