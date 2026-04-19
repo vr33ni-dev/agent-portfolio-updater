@@ -15,6 +15,7 @@ from audit import (
     _element_bounds,
     _fix_commented_blocks_inplace,
     _fix_structure_inplace,
+    _handle_drift_interactive,
     _list_en_pages,
     run_phase_1,
     run_phase_2,
@@ -797,3 +798,94 @@ def test_phase3_drift_and_sync_output(capsys):
     out = capsys.readouterr().out
     assert "LLM flagged translation drift" in out
     assert "Anthropic Claude" in out and "Anthropic API" in out
+
+
+def test_handle_drift_interactive_apply_uses_positional_replace():
+    """Applying a retranslated card must use positional replace so trailing-whitespace
+    differences between lang_card and the live file don't cause a silent no-op."""
+    from sync_translations import _split_sections
+
+    # Build a two-section file where the card has trailing whitespace in the stored version
+    preamble = "<section>\n"
+    original_lang_card = (
+        '<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">\n'
+        "  <h2>Proyecto</h2>\n"
+        "  <p class=\"mb-4\">Descripción original.</p>\n"
+        "</div>\n   "           # trailing whitespace — will trip up str.replace
+    )
+    stored_html = preamble + original_lang_card
+
+    en_card = (
+        '<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">\n'
+        "  <h2>Project</h2>\n"
+        "  <p class=\"mb-4\">Original description.</p>\n"
+        "</div>\n"
+    )
+
+    retranslated_card = (
+        '<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">\n'
+        "  <h2>Proyecto</h2>\n"
+        "  <p class=\"mb-4\">Descripción corregida.</p>\n"
+        "</div>\n"
+    )
+
+    fetched = {
+        "work.html": {"html": preamble + en_card},
+        "work.es.html": {"html": stored_html},
+    }
+    changed = []
+
+    llm = MagicMock()
+    llm.invoke.return_value.content.strip.return_value = retranslated_card
+
+    # card_idx=1 (index into _split_sections result: [preamble, card])
+    with patch("builtins.input", side_effect=["y", "y"]):
+        _handle_drift_interactive(
+            llm, "work.html", "work.es.html",
+            en_card, original_lang_card, "es",
+            fetched, changed, card_idx=1, critique="Extra sentence in ES",
+        )
+
+    # The fix must have been applied even though lang_card has trailing whitespace
+    assert "work.es.html" in changed
+    assert "Descripción corregida." in fetched["work.es.html"]["html"]
+
+
+def test_phase3_skips_llm_recheck_when_en_not_changed(capsys):
+    """Phase 3 should NOT call _llm_compare_translation a second time during navigation
+    if the EN file was not modified — it reuses the critique collected up front."""
+    preamble = "<section>\n"
+    en_card = (
+        '<div class="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6">\n'
+        "  <h2>Project</h2>\n"
+        "  <p class=\"mb-4\">Description.</p>\n"
+        '  <a href="https://github.com/vr33ni/proj">GitHub</a>\n'
+        "</div>\n"
+    )
+    lang_card = en_card.replace("Description.", "Descripción extra con contenido adicional.")
+    fetched = {
+        "work.html": {"html": preamble + en_card},
+        "work.es.html": {"html": preamble + lang_card},
+    }
+    portfolio = MagicMock()
+    portfolio.get_contents.return_value.decoded_content.decode.return_value = preamble + en_card
+
+    llm = MagicMock()
+    llm.invoke.return_value.content.strip.return_value = "ES adds extra content not in EN."
+
+    compare_call_count = {"n": 0}
+    real_compare = _llm_compare_translation
+
+    def _counting_compare(llm_, en_, lang_, lang):
+        compare_call_count["n"] += 1
+        return real_compare(llm_, en_, lang_, lang)
+
+    with patch("audit._list_en_pages", return_value=["work.html"]), \
+         patch("sync_translations._sync_file", return_value={}), \
+         patch("sync_translations._split_sections", side_effect=lambda html: ["<section>\n", html.replace("<section>\n", "")]), \
+         patch("audit._llm_compare_translation", side_effect=_counting_compare), \
+         patch("audit._handle_drift_interactive", return_value=None):
+        run_phase_3(llm, portfolio, fetched, "main")
+
+    # Called once during upfront collection; NOT again during navigation (EN not in changed)
+    assert compare_call_count["n"] == 1
