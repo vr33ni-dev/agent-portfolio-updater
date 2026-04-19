@@ -70,14 +70,20 @@ Match this exact Tailwind CSS structure:
 {card_template}
 """
 
-    results = {}
-    for lang, instruction in [
+    lang_instructions = [
         ("en", "Write the description and highlights in English."),
         ("es", "Write the description and highlights in Spanish. Keep technical terms (framework names, languages, tools) in English."),
         ("de", "Write the description and highlights in German. Keep technical terms (framework names, languages, tools) in English."),
-    ]:
-        response = llm.invoke(base_prompt + f"\nLanguage instruction: {instruction}")
-        results[lang] = response.content
+    ]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _invoke_lang(lang_instr):
+        lang, instruction = lang_instr
+        return lang, llm.invoke(base_prompt + f"\nLanguage instruction: {instruction}").content
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = dict(executor.map(_invoke_lang, lang_instructions))
 
     return {
         "summary_html": results["en"],

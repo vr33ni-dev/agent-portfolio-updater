@@ -20,9 +20,6 @@ def _replace_or_insert(current_html: str, card_html: str, repo_url: str, marker:
     Otherwise insert after the marker.
     Returns (updated_html, action) where action is 'updated' or 'added'.
     """
-    norm_url = _normalize_url(repo_url)
-    if _normalize_url(current_html) != current_html:  # skip normalization check shortcut
-        pass
     # Check if any variant of the URL appears in the HTML
     url_present = repo_url in current_html or repo_url.rstrip("/") in current_html
     if url_present:

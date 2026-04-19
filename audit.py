@@ -283,9 +283,8 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
 
         label = _card_label(en_card)
 
-        # ── Fetch all repos linked from this card ────────────────────────
-        repos_data = []
-        for repo_path in card_paths:
+        # ── Fetch all repos linked from this card (in parallel) ────────────
+        def _fetch_one(repo_path):
             try:
                 repo = g.get_repo(repo_path)
                 languages = list(repo.get_languages().keys())
@@ -297,7 +296,7 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                     readme = ""
                 subdir_readmes = _fetch_subdir_readmes(repo)
                 code_context = _fetch_code_context(repo)
-                repos_data.append({
+                return {
                     "repo": repo,
                     "languages": languages,
                     "topics": topics,
@@ -305,9 +304,14 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                     "readme": readme,
                     "subdir_readmes": subdir_readmes,
                     "code_context": code_context,
-                })
+                }
             except Exception:
                 print(f"    ⚠️  Could not fetch {repo_path} — skipping")
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor() as executor:
+            repos_data = [r for r in executor.map(_fetch_one, card_paths) if r is not None]
 
         if not repos_data:
             continue
@@ -701,8 +705,8 @@ def _fix_structure_inplace(fetched: dict) -> list[str]:
                 text = re.sub(r'<[^>]+>', ' ', el_html)
                 text = re.sub(r'\s+', ' ', text).strip()
                 if tag == "a":
-                    href = (re.search(r'href="([^"]+)"', el_html) or MagicMock()).group(1) \
-                        if re.search(r'href="([^"]+)"', el_html) else ""
+                    _href_m = re.search(r'href="([^"]+)"', el_html)
+                    href = _href_m.group(1) if _href_m else ""
                     preview = f"<a>  {text}  →  {href}"
                 elif tag == "ul":
                     items = re.findall(r'<li[^>]*>(.*?)</li>', el_html, re.DOTALL | re.IGNORECASE)
@@ -943,13 +947,14 @@ def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
         # Re-read en_card fresh so any EN edits from a previous comparison are picked up
         en_card = _split_sections(fetched[en_file]["html"])[card_idx]
         label = _card_label(en_card) or f"card {idx + 1}"
-        # Re-evaluate drift with the current EN (may have been updated during an earlier review)
-        fresh_critique = _llm_compare_translation(llm, en_card, lang_card, lang)
-        if fresh_critique is None:
-            print(f"\n    ✅  {lang_file} — {label}: drift resolved (EN was updated earlier)")
-            idx += 1
-            continue
-        critique = fresh_critique
+        # Re-evaluate drift only if EN was edited this session (avoids redundant LLM calls)
+        if en_file in changed:
+            fresh_critique = _llm_compare_translation(llm, en_card, lang_card, lang)
+            if fresh_critique is None:
+                print(f"\n    ✅  {lang_file} — {label}: drift resolved (EN was updated earlier)")
+                idx += 1
+                continue
+            critique = fresh_critique
         print(f"\n    ⚠️  {lang_file} — {label}: LLM flagged translation drift:")
         print(f"      {critique.strip()}")
         _print_card_summary(en_card, "EN")
@@ -1145,10 +1150,16 @@ def _handle_drift_interactive(
         if accept != "y":
             continue  # restart outer loop (back was pressed)
 
-        # Apply the fixed card back into the file
-        lang_html = fetched[lang_file]["html"]
-        new_html = lang_html.replace(lang_card, current_card, 1)
-        if new_html != lang_html:
+        # Apply the fixed card back into the file — positional replace to avoid whitespace mismatch
+        from sync_translations import _split_sections
+        old_html = fetched[lang_file]["html"]
+        lang_sections = _split_sections(old_html)
+        if 0 < card_idx < len(lang_sections):
+            lang_sections[card_idx] = current_card
+            new_html = "".join(lang_sections)
+        else:
+            new_html = old_html.replace(lang_card, current_card, 1)
+        if new_html != old_html:
             fetched[lang_file]["html"] = new_html
             if lang_file not in changed:
                 changed.append(lang_file)
