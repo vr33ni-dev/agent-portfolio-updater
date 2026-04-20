@@ -922,10 +922,20 @@ def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
     # card_idx lets us re-read en_card live from fetched so EN edits carry over across languages.
     drift_items = []
     for en_file in en_pages:
+        if en_file not in fetched:
+            try:
+                f = portfolio.get_contents(en_file, ref=read_ref)
+                fetched[en_file] = {"html": f.decoded_content.decode("utf-8"), "sha": f.sha}
+            except Exception:
+                continue  # EN file doesn't exist
         for lang in ("es", "de"):
             lang_file = _lang_filename(en_file, lang)
-            if lang_file not in fetched or en_file not in fetched:
-                continue
+            if lang_file not in fetched:
+                try:
+                    f = portfolio.get_contents(lang_file, ref=read_ref)
+                    fetched[lang_file] = {"html": f.decoded_content.decode("utf-8"), "sha": f.sha}
+                except Exception:
+                    continue  # translation file doesn't exist yet
             en_sections = _split_sections(fetched[en_file]["html"])
             lang_sections = _split_sections(fetched[lang_file]["html"])
             for i in range(1, min(len(en_sections), len(lang_sections))):
@@ -969,32 +979,73 @@ def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
 
 # ── Card summary printer ────────────────────────────────────────────────────
 def _print_card_summary(card_html: str, label: str) -> None:
-    """Print a structured summary of a card matching the HTML layout: headline, tech, description, bullets, link."""
+    """Print a summary of an HTML section. Extracts work-card fields (h2, tech line,
+    description, bullets, GitHub link) when present; falls back to plain text for
+    general page sections (e.g. index, about, contact)."""
     ind = "      "
     sep = f"{ind}{'─' * 44}"
     print(sep)
     print(f"{ind}{label}")
 
+    printed_something = False
+    printed_title = False
+
     title_m = re.search(r'<h2[^>]*>(.*?)</h2>', card_html, re.DOTALL)
     if title_m:
         print(f"{ind}  {re.sub(r'<[^>]+>', '', title_m.group(1)).strip()}")
+        printed_something = True
+        printed_title = True
 
     tech_m = TECH_P.search(card_html)
     if tech_m:
         print(f"{ind}  Tech:  {tech_m.group(1).strip()}")
+        printed_something = True
 
     desc_m = re.search(r'<p class="mb-4"[^>]*>(.*?)</p>', card_html, re.DOTALL)
     if desc_m:
         desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip()
         print(f"{ind}  {desc}")
+        printed_something = True
 
     bullets = re.findall(r'<li[^>]*>(.*?)</li>', card_html, re.DOTALL)
     for b in bullets:
         print(f"{ind}  • {re.sub(r'<[^>]+>', '', b).strip()}")
+        printed_something = True
 
     link_m = re.search(r'href="(https://github\.com/[^"]+)"', card_html)
     if link_m:
         print(f"{ind}  {link_m.group(1)}")
+        printed_something = True
+
+    # Fallback for non-card sections:
+    # - if nothing recognizable printed, show plain text preview
+    # - if only a title printed, also show body preview so drift is visible
+    if (not printed_something) or (printed_title and not (tech_m or desc_m or bullets or link_m)):
+        plain = re.sub(r'<[^>]+>', ' ', card_html)
+        plain = re.sub(r'\s+', ' ', plain).strip()
+        if title_m:
+            title_text = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+            if title_text:
+                # Remove only the first title occurrence from preview body.
+                plain = re.sub(re.escape(title_text), '', plain, count=1).strip(" :-\u2014\u2013")
+        if not plain:
+            plain = re.sub(r'<[^>]+>', ' ', card_html)
+            plain = re.sub(r'\s+', ' ', plain).strip()
+        import textwrap
+        if len(plain) <= 300:
+            # If short, print all
+            print(f"{ind}  {plain}")
+        else:
+            # Otherwise, split into lines by sentence or period, fallback to 80-char chunks
+            lines = [l.strip() for l in re.split(r'(?<=[.!?])\s+', plain) if l.strip()]
+            if not lines or len(lines) == 1:
+                lines = textwrap.wrap(plain, 80)
+            max_lines = 5
+            for i, line in enumerate(lines):
+                if i >= max_lines:
+                    print(f"{ind}  …")
+                    break
+                print(f"{ind}  {line}")
 
     print(sep)
 
@@ -1019,19 +1070,20 @@ def _handle_drift_interactive(
             f"- Return ONLY the updated card HTML, no markdown, no backticks.\n\n"
             f"CURRENT ENGLISH CARD:\n{en_ref[0]}\n"
         ).content.strip()
-        en_ref[0] = new_en
-        if card_idx >= 0:
-            # Positional replace — reliable regardless of whitespace differences
-            sections = _split_sections(fetched[en_file]["html"])
-            sections[card_idx] = new_en
-            fetched[en_file]["html"] = "".join(sections)
-        else:
-            # Fallback: string replace (card_idx unavailable)
-            old_html = fetched[en_file]["html"]
-            fetched[en_file]["html"] = old_html.replace(en_card, new_en, 1)
-        if en_file not in changed:
-            changed.append(en_file)
-        print(f"      ✅  Updated EN card in {en_file}")
+        if new_en != en_ref[0]:
+            en_ref[0] = new_en
+            if card_idx >= 0:
+                # Positional replace — reliable regardless of whitespace differences
+                sections = _split_sections(fetched[en_file]["html"])
+                sections[card_idx] = new_en
+                fetched[en_file]["html"] = "".join(sections)
+            else:
+                # Fallback: string replace (card_idx unavailable)
+                old_html = fetched[en_file]["html"]
+                fetched[en_file]["html"] = old_html.replace(en_card, new_en, 1)
+            if en_file not in changed:
+                changed.append(en_file)
+            print(f"      ✅  Updated EN card in {en_file}")
         return new_en
 
     def _discuss(concern: str) -> str:
@@ -1163,7 +1215,11 @@ def _handle_drift_interactive(
             fetched[lang_file]["html"] = new_html
             if lang_file not in changed:
                 changed.append(lang_file)
-            print(f"      ✅  Applied fix to {lang_file}")
+            lang_code = lang_file.split(".")[-2] if "." in lang_file else lang_file
+            if lang_code in ("es", "de"):
+                print(f"      ✅  Updated {lang_code.upper()} card in {lang_file}")
+            else:
+                print(f"      ✅  Updated card in {lang_file}")
         return None
 
 

@@ -863,9 +863,11 @@ def test_phase3_skips_llm_recheck_when_en_not_changed(capsys):
         "</div>\n"
     )
     lang_card = en_card.replace("Description.", "Descripción extra con contenido adicional.")
+    de_card = en_card.replace("Description.", "Zusätzlicher Inhalt.")
     fetched = {
         "work.html": {"html": preamble + en_card},
         "work.es.html": {"html": preamble + lang_card},
+        "work.de.html": {"html": preamble + de_card},
     }
     portfolio = MagicMock()
     portfolio.get_contents.return_value.decoded_content.decode.return_value = preamble + en_card
@@ -887,5 +889,6 @@ def test_phase3_skips_llm_recheck_when_en_not_changed(capsys):
          patch("audit._handle_drift_interactive", return_value=None):
         run_phase_3(llm, portfolio, fetched, "main")
 
-    # Called once during upfront collection; NOT again during navigation (EN not in changed)
-    assert compare_call_count["n"] == 1
+    # Called once per language during upfront collection (ES + DE = 2);
+    # NOT called again during navigation since EN was not modified
+    assert compare_call_count["n"] == 2
