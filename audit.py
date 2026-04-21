@@ -91,6 +91,14 @@ def _front_matter_block(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def _split_front_matter_text(text: str) -> tuple[str, str]:
+    """Return (front_matter, body) where front_matter includes delimiters if present."""
+    front_matter = _front_matter_block(text)
+    if front_matter:
+        return front_matter, text[len(front_matter):]
+    return "", text
+
+
 def _preserves_protected_attrs(original_html: str, updated_html: str) -> bool:
     """Require href/src/id attribute values to remain byte-for-byte identical."""
     return _protected_attr_snapshot(original_html) == _protected_attr_snapshot(updated_html)
@@ -1235,6 +1243,7 @@ def _handle_drift_interactive(
     def _rewrite_en(instruction: str) -> str:
         """Rewrite the EN card using the given instruction, update fetched and en_ref."""
         from sync_translations import _split_sections
+        original_front_matter, original_body = _split_front_matter_text(en_ref[0])
         new_en = llm.invoke(
             f"Update the following English portfolio card according to this instruction:\n{instruction}\n\n"
             f"Rules:\n"
@@ -1242,11 +1251,12 @@ def _handle_drift_interactive(
             f"- If YAML front matter is present, preserve it exactly, including every permalink line.\n"
             f"- Never change any permalink, href, src, id, anchor target, or URL slug.\n"
             f"- Return ONLY the updated card HTML, no markdown, no backticks.\n\n"
-            f"CURRENT ENGLISH CARD:\n{en_ref[0]}\n"
+            f"CURRENT ENGLISH CARD:\n{original_body}\n"
         ).content.strip()
         if not _looks_like_card_html(new_en):
             print("      ⚠️  EN rewrite returned invalid/empty HTML; keeping current EN card.")
             return en_ref[0]
+        new_en = original_front_matter + new_en
         if not _preserves_front_matter(en_ref[0], new_en):
             print("      ⚠️  EN rewrite changed YAML front matter/permalink; keeping current EN card.")
             return en_ref[0]
@@ -1326,6 +1336,8 @@ def _handle_drift_interactive(
 
     def _retranslate(card: str, feedback: str = "") -> str:
         extra = f"\nUser feedback to address: {feedback}\n" if feedback else ""
+        original_front_matter, original_body = _split_front_matter_text(card)
+        _en_front_matter, en_body = _split_front_matter_text(en_ref[0])
         translated = llm.invoke(
             f"Retranslate the following English portfolio card into {lang_label}.\n"
             f"Rules:\n"
@@ -1335,11 +1347,12 @@ def _handle_drift_interactive(
             f"- Never change any permalink, href, src, id, anchor target, or URL slug.\n"
             f"- Return ONLY the translated card HTML, no markdown, no backticks.\n"
             f"{extra}\n"
-            f"ENGLISH CARD:\n{en_ref[0]}\n"
+            f"ENGLISH CARD:\n{en_body}\n"
         ).content.strip()
         if not _looks_like_card_html(translated):
             print(f"      ⚠️  {lang_label} retranslation returned invalid/empty HTML; keeping current translation.")
             return card
+        translated = original_front_matter + translated
         if not _preserves_front_matter(card, translated):
             print(f"      ⚠️  {lang_label} retranslation changed YAML front matter/permalink; keeping current translation.")
             return card
