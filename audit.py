@@ -104,9 +104,18 @@ def _preserves_protected_attrs(original_html: str, updated_html: str) -> bool:
     return _protected_attr_snapshot(original_html) == _protected_attr_snapshot(updated_html)
 
 
-def _preserves_front_matter(original_text: str, updated_text: str) -> bool:
-    """Require YAML front matter to remain byte-for-byte identical."""
-    return _front_matter_block(original_text) == _front_matter_block(updated_text)
+def _front_matter_permalink(text: str) -> str | None:
+    """Return the permalink value from YAML front matter, if present."""
+    front_matter = _front_matter_block(text)
+    if not front_matter:
+        return None
+    match = re.search(r'^permalink:\s*(.+)$', front_matter, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _preserves_permalink(original_text: str, updated_text: str) -> bool:
+    """Require only the permalink line in YAML front matter to remain identical."""
+    return _front_matter_permalink(original_text) == _front_matter_permalink(updated_text)
 
 
 # ── Utility ─────────────────────────────────────────────────────────────────
@@ -1248,7 +1257,7 @@ def _handle_drift_interactive(
             f"Update the following English portfolio card according to this instruction:\n{instruction}\n\n"
             f"Rules:\n"
             f"- Preserve the exact HTML structure and Tailwind CSS classes.\n"
-            f"- If YAML front matter is present, preserve it exactly, including every permalink line.\n"
+            f"- If YAML front matter is present, do not change the permalink line.\n"
             f"- Never change any permalink, href, src, id, anchor target, or URL slug.\n"
             f"- Return ONLY the updated card HTML, no markdown, no backticks.\n\n"
             f"CURRENT ENGLISH CARD:\n{original_body}\n"
@@ -1257,8 +1266,8 @@ def _handle_drift_interactive(
             print("      ⚠️  EN rewrite returned invalid/empty HTML; keeping current EN card.")
             return en_ref[0]
         new_en = original_front_matter + new_en
-        if not _preserves_front_matter(en_ref[0], new_en):
-            print("      ⚠️  EN rewrite changed YAML front matter/permalink; keeping current EN card.")
+        if not _preserves_permalink(en_ref[0], new_en):
+            print("      ⚠️  EN rewrite changed YAML permalink; keeping current EN card.")
             return en_ref[0]
         if not _preserves_protected_attrs(en_ref[0], new_en):
             print("      ⚠️  EN rewrite changed protected permalink attributes; keeping current EN card.")
@@ -1343,7 +1352,7 @@ def _handle_drift_interactive(
             f"Rules:\n"
             f"- Keep all technical terms and technology names in English.\n"
             f"- Preserve the exact HTML structure and Tailwind CSS classes.\n"
-            f"- If YAML front matter is present, preserve it exactly, including every permalink line.\n"
+            f"- If YAML front matter is present, do not change the permalink line.\n"
             f"- Never change any permalink, href, src, id, anchor target, or URL slug.\n"
             f"- Return ONLY the translated card HTML, no markdown, no backticks.\n"
             f"{extra}\n"
@@ -1353,8 +1362,8 @@ def _handle_drift_interactive(
             print(f"      ⚠️  {lang_label} retranslation returned invalid/empty HTML; keeping current translation.")
             return card
         translated = original_front_matter + translated
-        if not _preserves_front_matter(card, translated):
-            print(f"      ⚠️  {lang_label} retranslation changed YAML front matter/permalink; keeping current translation.")
+        if not _preserves_permalink(card, translated):
+            print(f"      ⚠️  {lang_label} retranslation changed YAML permalink; keeping current translation.")
             return card
         if not _preserves_protected_attrs(card, translated):
             print(f"      ⚠️  {lang_label} retranslation changed protected permalink attributes; keeping current translation.")
