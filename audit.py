@@ -88,19 +88,58 @@ def _card_label(chunk: str) -> str:
 
 # ── Session open / close ─────────────────────────────────────────────────────
 
+def _is_pr_behind_main(portfolio, pr_ref: str) -> bool:
+    """Simple check: PR commit is older than main commit. Returns True if behind."""
+    try:
+        default_branch = portfolio.default_branch
+        main_ref = portfolio.get_git_ref(f"heads/{default_branch}")
+        pr_ref_obj = portfolio.get_git_ref(f"heads/{pr_ref}")
+        main_commit = portfolio.get_git_commit(main_ref.object.sha)
+        pr_commit = portfolio.get_git_commit(pr_ref_obj.object.sha)
+        return pr_commit.committer.date < main_commit.committer.date
+    except Exception:
+        return False  # default: assume not behind if we can't determine
+
+
 def _open_fix_session(g: Github):
     """Fetch all portfolio files and find open audit PR.
     Returns (portfolio, fetched, read_ref, open_audit_pr).
-    fetched maps filename → {"html": str, "sha": str}."""
+    fetched maps filename → {"html": str, "sha": str}.
+    Baseline priority: PREFER_MAIN_BASELINE env → skip stale PR, else prompt user."""
     portfolio = g.get_repo(PORTFOLIO_REPO)
     open_audit_pr = None
     read_ref = portfolio.default_branch
+    
+    # Check for open audit PR
     for pr in portfolio.get_pulls(state="open"):
         if pr.head.ref.startswith("audit/"):
             open_audit_pr = pr
-            read_ref = pr.head.ref
-            print(f"ℹ️  Using open audit PR branch: {read_ref}\n")
             break
+    
+    # Decide baseline: prefer main if env set, else prompt if PR exists and is behind
+    prefer_main = os.getenv("PREFER_MAIN_BASELINE", "false").lower() == "true"
+    
+    if open_audit_pr and not prefer_main:
+        is_behind = _is_pr_behind_main(portfolio, open_audit_pr.head.ref)
+        if is_behind:
+            print(f"\n⚠️  Open audit PR ({open_audit_pr.head.ref}) is behind {portfolio.default_branch}.")
+            choice = input(f"  Use main baseline or continue with stale PR baseline? [main/pr] ").strip().lower()
+            if choice == "pr":
+                read_ref = open_audit_pr.head.ref
+                print(f"ℹ️  Using open audit PR branch (stale): {read_ref}\n")
+            else:
+                print(f"ℹ️  Using main branch as baseline: {read_ref}\n")
+                open_audit_pr = None  # clear PR ref so new one gets created
+        else:
+            read_ref = open_audit_pr.head.ref
+            print(f"ℹ️  Using open audit PR branch (up-to-date): {read_ref}\n")
+    elif prefer_main and open_audit_pr:
+        print(f"ℹ️  PREFER_MAIN_BASELINE=true; using main branch, not PR: {read_ref}\n")
+        open_audit_pr = None  # clear PR ref
+    elif open_audit_pr:
+        read_ref = open_audit_pr.head.ref
+        print(f"ℹ️  Using open audit PR branch: {read_ref}\n")
+    
     fetched = {}
     for filename in PORTFOLIO_FILES:
         f = portfolio.get_contents(filename, ref=read_ref)
@@ -1060,6 +1099,17 @@ def _handle_drift_interactive(
     current_card = lang_card
     en_ref = [en_card]  # mutable so EN updates propagate to retranslate
 
+    def _looks_like_card_html(text: str) -> bool:
+        """Basic sanity check to avoid applying empty/non-HTML model outputs."""
+        if not text:
+            return False
+        t = text.strip()
+        if len(t) < 40:
+            return False
+        if "<" not in t or ">" not in t:
+            return False
+        return any(k in t.lower() for k in ("<h2", "<p", "<li", "<div", "<section"))
+
     def _rewrite_en(instruction: str) -> str:
         """Rewrite the EN card using the given instruction, update fetched and en_ref."""
         from sync_translations import _split_sections
@@ -1070,6 +1120,9 @@ def _handle_drift_interactive(
             f"- Return ONLY the updated card HTML, no markdown, no backticks.\n\n"
             f"CURRENT ENGLISH CARD:\n{en_ref[0]}\n"
         ).content.strip()
+        if not _looks_like_card_html(new_en):
+            print("      ⚠️  EN rewrite returned invalid/empty HTML; keeping current EN card.")
+            return en_ref[0]
         if new_en != en_ref[0]:
             en_ref[0] = new_en
             if card_idx >= 0:
@@ -1114,16 +1167,36 @@ def _handle_drift_interactive(
 
     def _maybe_update_en(instruction: str) -> None:
         """Rewrite EN card only if the user explicitly asks to update/fix/change the English card."""
-        en_keywords = ("update the english", "fix the english", "change the english",
-                       "update english card", "fix english card", "update the en card",
-                       "fix the en card", "update en card", "also update english",
-                       "also fix english", "en version", "english version", "english card")
-        if any(k in instruction.lower() for k in en_keywords):
+        text = instruction.lower()
+        # Avoid false positives when the instruction explicitly says EN should NOT be updated.
+        negative_patterns = (
+            r"does not require updating\s+(the\s+)?english",
+            r"doesn't require updating\s+(the\s+)?english",
+            r"do not update\s+(the\s+)?english",
+            r"don't update\s+(the\s+)?english",
+            r"no need to update\s+(the\s+)?english",
+        )
+        if any(re.search(p, text) for p in negative_patterns):
+            return
+
+        positive_patterns = (
+            r"update\s+(the\s+)?english",
+            r"fix\s+(the\s+)?english",
+            r"change\s+(the\s+)?english",
+            r"update\s+(the\s+)?en\s+card",
+            r"fix\s+(the\s+)?en\s+card",
+            r"english\s+card\s+needs\s+to\s+be\s+updated",
+            r"requires\s+updating\s+both\s+the\s+english\s+and\s+spanish",
+            r"requires\s+updating\s+the\s+english",
+            r"both\s+cards?.*english",
+            r"english.*spanish.*cards?",
+        )
+        if any(re.search(p, text) for p in positive_patterns):
             _rewrite_en(instruction)
 
     def _retranslate(card: str, feedback: str = "") -> str:
         extra = f"\nUser feedback to address: {feedback}\n" if feedback else ""
-        return llm.invoke(
+        translated = llm.invoke(
             f"Retranslate the following English portfolio card into {lang_label}.\n"
             f"Rules:\n"
             f"- Keep all technical terms and technology names in English.\n"
@@ -1132,6 +1205,10 @@ def _handle_drift_interactive(
             f"{extra}\n"
             f"ENGLISH CARD:\n{en_ref[0]}\n"
         ).content.strip()
+        if not _looks_like_card_html(translated):
+            print(f"      ⚠️  {lang_label} retranslation returned invalid/empty HTML; keeping current translation.")
+            return card
+        return translated
 
     def _show_card(card: str) -> None:
         _print_card_summary(en_ref[0], "EN")
@@ -1160,8 +1237,8 @@ def _handle_drift_interactive(
                 instruction = concern
             else:
                 instruction = response
-            # Offer to update EN if the user's own words explicitly target it
-            _maybe_update_en(concern)
+            # Offer to update EN when the final instruction explicitly requires it.
+            _maybe_update_en(instruction)
             current_card = _retranslate(current_card, instruction)
         else:
             print("      Options: y  improve  n  back")
@@ -1193,8 +1270,8 @@ def _handle_drift_interactive(
                     instruction = concern
                 else:
                     instruction = response
-                # Offer to update EN if the user's own words explicitly target it
-                _maybe_update_en(concern)
+                # Offer to update EN when the final instruction explicitly requires it.
+                _maybe_update_en(instruction)
                 current_card = _retranslate(current_card, instruction)
                 _show_card(current_card)
             else:
@@ -1268,6 +1345,7 @@ def main():
         ("3", "Translation Content Review",
          lambda: run_phase_3(llm, portfolio, fetched, read_ref)),
     ]
+    phase_changed_keys: set[str] = set()
 
     while True:
         print("\n" + "═" * 60)
@@ -1296,6 +1374,8 @@ def main():
             label, run_fn = phase_map[key]
             changed = run_fn()
             all_changed.update(changed)
+            if changed:
+                phase_changed_keys.add(key)
             # Offer to continue to the next phase when running sequentially
             if i < len(keys_to_run) - 1:
                 cont = input("\n  ▶  Continue to next phase? [y/n] ").strip().lower()
@@ -1314,6 +1394,37 @@ def main():
         print("Aborted.")
         return
 
+    key_to_label = {key: label for key, label, _ in PHASES}
+    keys_for_summary = [key for key, _, _ in PHASES if key in phase_changed_keys]
+    if not keys_for_summary:
+        # Fallback: if we have changed files but no per-phase record, summarize all phases.
+        keys_for_summary = [key for key, _, _ in PHASES]
+
+    commit_lines = ["chore: audit pass — update portfolio", ""]
+    commit_lines.append("- phases with accepted changes: " + ", ".join(keys_for_summary))
+    commit_lines.append("- updated files: " + ", ".join(changed_list))
+    commit_msg = "\n".join(commit_lines)
+
+    pr_sections: list[str] = ["Automated audit pass — summary for this run:\n"]
+    pr_sections.append("**Phases with accepted changes**")
+    for key in keys_for_summary:
+        pr_sections.append(f"- Phase {key} — {key_to_label[key]}")
+    pr_sections.append("")
+    pr_sections.append("**Updated files**")
+    for filename in changed_list:
+        pr_sections.append(f"- {filename}")
+    pr_sections.append("")
+    pr_sections.append("**Notes**")
+    pr_sections.append("- This summary is generated from changes accepted during this audit run.")
+    pr_sections.append("- It intentionally avoids claiming specific fix types that were not explicitly recorded.")
+
+    pr_body = "\n".join(pr_sections).strip()
+
+    if len(keys_for_summary) == 1:
+        pr_title = f"Portfolio audit: phase {keys_for_summary[0]}"
+    else:
+        pr_title = "Portfolio audit"
+
     pr_url = _close_fix_session(
         portfolio=portfolio,
         fetched=fetched,
@@ -1321,30 +1432,9 @@ def main():
         read_ref=read_ref,
         open_audit_pr=open_audit_pr,
         branch_prefix="update-cards",
-        commit_msg=(
-            "chore: audit pass — update portfolio\n\n"
-            "- fix stale/transferred GitHub links\n"
-            "- update tech stack subtitles where languages/topics changed\n"
-            "- refresh description paragraphs where README has drifted\n"
-            "- normalize Tailwind CSS classes within cards\n"
-            "- reorder ES/DE cards to match EN\n"
-            "- remove blocks commented-out in EN but present in translations\n"
-            "- add missing translated sections"
-        ),
-        pr_title="Portfolio audit",
-        pr_body=(
-            "Automated audit pass — applied the following fixes as needed:\n\n"
-            "**Phase 1 — English Baseline & Repo Check**\n"
-            "- Corrected transferred/stale repo URLs\n"
-            "- Updated tech stack subtitles\n"
-            "- Refreshed description paragraphs and bullets\n\n"
-            "**Phase 2 — HTML Structure Consistency**\n"
-            "- Normalized Tailwind CSS class strings\n"
-            "- Reordered ES/DE cards to match EN\n"
-            "- Removed commented-out blocks from translations\n\n"
-            "**Phase 3 — Translation Content Review**\n"
-            "- Added missing translated sections"
-        ),
+        commit_msg=commit_msg,
+        pr_title=pr_title,
+        pr_body=pr_body,
     )
     print(f"\n✅ PR: {pr_url}")
 
