@@ -107,6 +107,7 @@ def _translate(llm: ChatAnthropic, section: str, lang: str) -> str:
         f'Translate the visible text in the following HTML into {lang_label}.\n\n'
         f'Rules:\n'
         f'- Preserve ALL HTML tags, attributes, class names, href and src values EXACTLY.\n'
+        f'- Never change any permalink, anchor target, id, URL slug, href, or src value.\n'
         f'- Keep technical terms, tool names, and proper nouns in English '
         f'(e.g. "Python", "FastAPI", "GitHub", "Docker").\n'
         f'- Also keep these words in English (do not translate): '

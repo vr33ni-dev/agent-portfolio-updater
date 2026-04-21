@@ -55,6 +55,52 @@ def _card_to_text(card_html: str) -> str:
     return '\n'.join(lines) or card_html
 
 
+def _extract_tech_terms(html: str) -> set[str]:
+    """Extract known technology terms from text for concise drift hints."""
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = re.sub(r'\s+', ' ', text).lower()
+    catalog = {
+        "react": r"\breact\b",
+        "vue": r"\bvue(?:\.js)?\b",
+        "stencil": r"\bstencil\b",
+        "typescript": r"\btypescript\b",
+        "spring boot": r"\bspring\s*boot\b",
+        "spring": r"\bspring\b",
+        "go": r"\bgo\b",
+        "node.js": r"\bnode(?:\.js)?\b",
+        "docker": r"\bdocker\b",
+        "openshift": r"\bopenshift\b",
+        "github actions": r"\bgithub\s+actions\b",
+        "ci/cd": r"\bci\s*/\s*cd\b",
+        "cloud": r"\bcloud\b",
+    }
+    return {name for name, pattern in catalog.items() if re.search(pattern, text)}
+
+
+def _protected_attr_snapshot(html: str) -> tuple[list[str], list[str], list[str]]:
+    """Capture protected attribute values that must never change during rewrites."""
+    hrefs = re.findall(r'\bhref="([^"]+)"', html, re.IGNORECASE)
+    srcs = re.findall(r'\bsrc="([^"]+)"', html, re.IGNORECASE)
+    ids = re.findall(r'\bid="([^"]+)"', html, re.IGNORECASE)
+    return hrefs, srcs, ids
+
+
+def _front_matter_block(text: str) -> str:
+    """Return the YAML front matter block, including delimiters, or an empty string."""
+    match = re.match(r'^(---\n.*?\n---\n?)', text, re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def _preserves_protected_attrs(original_html: str, updated_html: str) -> bool:
+    """Require href/src/id attribute values to remain byte-for-byte identical."""
+    return _protected_attr_snapshot(original_html) == _protected_attr_snapshot(updated_html)
+
+
+def _preserves_front_matter(original_text: str, updated_text: str) -> bool:
+    """Require YAML front matter to remain byte-for-byte identical."""
+    return _front_matter_block(original_text) == _front_matter_block(updated_text)
+
+
 # ── Utility ─────────────────────────────────────────────────────────────────
 
 def extract_repo_links(html: str) -> list[str]:
@@ -487,19 +533,24 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
 
                 def _generate_desc(card_chunk, feedback_hint=""):
                     extra = f'\nFeedback to address: {feedback_hint}\n' if feedback_hint else ''
-                    return llm.invoke(
+                    generated = llm.invoke(
                         f'Rewrite ONLY the description paragraph and bullet list for this portfolio card.\n\n'
                         f'Current card:\n{card_chunk}\n\n'
                         f'READMEs:\n{readme_str[:2500]}\n\n'
                         f'Code context:\n{code_str[:1500]}\n\n'
                         f'Rules:\n'
                         f'- Keep the project name heading, tech subtitle, and GitHub link(s) EXACTLY as-is.\n'
+                        f'- Never change any permalink, href, src, id, anchor target, or URL slug.\n'
                         f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
                         f'- Description: 2-3 sentences. Bullets: 2-3 items.\n'
                         f'- Write in English.\n'
                         f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
                         f'{extra}'
                     ).content.strip()
+                    if not _preserves_protected_attrs(card_chunk, generated):
+                        print("       ⚠️  Rejected description rewrite because protected permalink attributes changed.")
+                        return card_chunk
+                    return generated
 
                 def _critique_desc(card_chunk):
                     response = llm.invoke(
@@ -547,12 +598,18 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                         break
                     elif choice == "improve":
                         feedback = input("         What to change: ").strip()
-                        en_new_card = llm.invoke(
+                        improved = llm.invoke(
                             f'Improve this portfolio card based on the user\'s feedback.\n\n'
                             f'Card:\n{en_new_card}\n\n'
                             f'Feedback: {feedback}\n\n'
-                            f'Return the FULL updated card HTML only. No markdown, no backticks.'
+                            f'Rules:\n'
+                            f'- Never change any permalink, href, src, id, anchor target, or URL slug.\n'
+                            f'- Return the FULL updated card HTML only. No markdown, no backticks.'
                         ).content.strip()
+                        if not _preserves_protected_attrs(en_new_card, improved):
+                            print("       ⚠️  Rejected improvement because protected permalink attributes changed.")
+                            improved = en_new_card
+                        en_new_card = improved
                         print(f"\n{sep}")
                         print(_card_to_text(en_new_card))
                         print(sep)
@@ -616,10 +673,14 @@ def _fix_card_content_inplace(g: Github, llm: ChatAnthropic, fetched: dict) -> l
                         f'READMEs:\n{readme_str[:2500]}\n\n'
                         f'Rules:\n'
                         f'- Keep the project name heading, tech subtitle, and GitHub link(s) EXACTLY as-is.\n'
+                        f'- Never change any permalink, href, src, id, anchor target, or URL slug.\n'
                         f'- Replace only the <p class="mb-4">...</p> and <ul ...>...</ul> sections.\n'
                         f'- {lang_instruction}\n'
                         f'- Return the FULL card HTML. No markdown, no backticks, no explanation.'
                     ).content.strip()
+                    if not _preserves_protected_attrs(file_parts[card_idx], new_card):
+                        print(f"       ⚠️  Rejected {_lang.upper()} rewrite because protected permalink attributes changed.")
+                        new_card = file_parts[card_idx]
                     file_parts[card_idx] = new_card + "\n"
                     new = "".join(file_parts)
                     if new != old:
@@ -977,7 +1038,15 @@ def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
                     continue  # translation file doesn't exist yet
             en_sections = _split_sections(fetched[en_file]["html"])
             lang_sections = _split_sections(fetched[lang_file]["html"])
-            for i in range(1, min(len(en_sections), len(lang_sections))):
+            min_len = min(len(en_sections), len(lang_sections))
+            # Standard case: index 0 is preamble and real sections/cards start at 1.
+            # Single-chunk pages (no section/article/card split) must compare index 0.
+            if min_len == 1:
+                section_indices = range(0, 1)
+            else:
+                section_indices = range(1, min_len)
+
+            for i in section_indices:
                 en_card = en_sections[i]
                 lang_card = lang_sections[i]
                 if not re.search(r'\w', en_card) or not re.search(r'\w', lang_card):
@@ -1006,6 +1075,14 @@ def run_phase_3(llm, portfolio, fetched: dict, read_ref: str) -> list[str]:
             critique = fresh_critique
         print(f"\n    ⚠️  {lang_file} — {label}: LLM flagged translation drift:")
         print(f"      {critique.strip()}")
+        en_terms = _extract_tech_terms(en_card)
+        lang_terms = _extract_tech_terms(lang_card)
+        missing_terms = sorted(en_terms - lang_terms)
+        extra_terms = sorted(lang_terms - en_terms)
+        if missing_terms:
+            print(f"      Tech terms missing in {lang.upper()}: {', '.join(missing_terms)}")
+        if extra_terms:
+            print(f"      Tech terms added in {lang.upper()}: {', '.join(extra_terms)}")
         _print_card_summary(en_card, "EN")
         _print_card_summary(lang_card, lang.upper())
         result = _handle_drift_interactive(llm, en_file, lang_file, en_card, lang_card, lang, fetched, changed, card_idx, critique)
@@ -1045,21 +1122,66 @@ def _print_card_summary(card_html: str, label: str) -> None:
         desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip()
         print(f"{ind}  {desc}")
         printed_something = True
+    else:
+        # Non-card sections often use plain <p> tags (without mb-4).
+        # Show up to 2 paragraph lines so key semantic diffs are visible.
+        generic_paras = re.findall(r'<p\b[^>]*>(.*?)</p>', card_html, re.DOTALL | re.IGNORECASE)
+        shown = 0
+        for p in generic_paras:
+            text = re.sub(r'<[^>]+>', '', p)
+            text = re.sub(r'\s+', ' ', text).strip()
+            if not text:
+                continue
+            print(f"{ind}  {text}")
+            printed_something = True
+            shown += 1
+            if shown >= 2:
+                break
 
     bullets = re.findall(r'<li[^>]*>(.*?)</li>', card_html, re.DOTALL)
     for b in bullets:
         print(f"{ind}  • {re.sub(r'<[^>]+>', '', b).strip()}")
         printed_something = True
 
-    link_m = re.search(r'href="(https://github\.com/[^"]+)"', card_html)
-    if link_m:
-        print(f"{ind}  {link_m.group(1)}")
+    link_matches = re.findall(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', card_html, re.DOTALL | re.IGNORECASE)
+    shown_links = 0
+    for href, anchor_html in link_matches:
+        anchor_text = re.sub(r'<[^>]+>', '', anchor_html)
+        anchor_text = re.sub(r'\s+', ' ', anchor_text).strip()
+        if not anchor_text and not href:
+            continue
+        if anchor_text:
+            print(f"{ind}  Link: {anchor_text} -> {href}")
+        else:
+            print(f"{ind}  Link: {href}")
         printed_something = True
+        shown_links += 1
+        if shown_links >= 3:
+            break
+
+    comment_blocks = re.findall(r'<!--(.*?)-->', card_html, re.DOTALL)
+    commented_links = []
+    for block in comment_blocks:
+        commented_links.extend(
+            re.findall(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL | re.IGNORECASE)
+        )
+    shown_commented = 0
+    for href, anchor_html in commented_links:
+        anchor_text = re.sub(r'<[^>]+>', '', anchor_html)
+        anchor_text = re.sub(r'\s+', ' ', anchor_text).strip()
+        if anchor_text:
+            print(f"{ind}  Commented link: {anchor_text} -> {href}")
+        else:
+            print(f"{ind}  Commented link: {href}")
+        printed_something = True
+        shown_commented += 1
+        if shown_commented >= 2:
+            break
 
     # Fallback for non-card sections:
     # - if nothing recognizable printed, show plain text preview
     # - if only a title printed, also show body preview so drift is visible
-    if (not printed_something) or (printed_title and not (tech_m or desc_m or bullets or link_m)):
+    if (not printed_something) or (printed_title and not (tech_m or desc_m or bullets or link_matches or commented_links)):
         plain = re.sub(r'<[^>]+>', ' ', card_html)
         plain = re.sub(r'\s+', ' ', plain).strip()
         if title_m:
@@ -1117,11 +1239,19 @@ def _handle_drift_interactive(
             f"Update the following English portfolio card according to this instruction:\n{instruction}\n\n"
             f"Rules:\n"
             f"- Preserve the exact HTML structure and Tailwind CSS classes.\n"
+            f"- If YAML front matter is present, preserve it exactly, including every permalink line.\n"
+            f"- Never change any permalink, href, src, id, anchor target, or URL slug.\n"
             f"- Return ONLY the updated card HTML, no markdown, no backticks.\n\n"
             f"CURRENT ENGLISH CARD:\n{en_ref[0]}\n"
         ).content.strip()
         if not _looks_like_card_html(new_en):
             print("      ⚠️  EN rewrite returned invalid/empty HTML; keeping current EN card.")
+            return en_ref[0]
+        if not _preserves_front_matter(en_ref[0], new_en):
+            print("      ⚠️  EN rewrite changed YAML front matter/permalink; keeping current EN card.")
+            return en_ref[0]
+        if not _preserves_protected_attrs(en_ref[0], new_en):
+            print("      ⚠️  EN rewrite changed protected permalink attributes; keeping current EN card.")
             return en_ref[0]
         if new_en != en_ref[0]:
             en_ref[0] = new_en
@@ -1201,12 +1331,20 @@ def _handle_drift_interactive(
             f"Rules:\n"
             f"- Keep all technical terms and technology names in English.\n"
             f"- Preserve the exact HTML structure and Tailwind CSS classes.\n"
+            f"- If YAML front matter is present, preserve it exactly, including every permalink line.\n"
+            f"- Never change any permalink, href, src, id, anchor target, or URL slug.\n"
             f"- Return ONLY the translated card HTML, no markdown, no backticks.\n"
             f"{extra}\n"
             f"ENGLISH CARD:\n{en_ref[0]}\n"
         ).content.strip()
         if not _looks_like_card_html(translated):
             print(f"      ⚠️  {lang_label} retranslation returned invalid/empty HTML; keeping current translation.")
+            return card
+        if not _preserves_front_matter(card, translated):
+            print(f"      ⚠️  {lang_label} retranslation changed YAML front matter/permalink; keeping current translation.")
+            return card
+        if not _preserves_protected_attrs(card, translated):
+            print(f"      ⚠️  {lang_label} retranslation changed protected permalink attributes; keeping current translation.")
             return card
         return translated
 
