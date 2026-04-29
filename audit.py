@@ -1302,17 +1302,6 @@ def _handle_drift_interactive(
         ).content.strip()
         return response
 
-    def _plan_improvement(card: str, hint: str = "") -> str:
-        """Ask LLM to describe what it would change, without generating HTML yet."""
-        extra = f"\nThe user's specific instruction: {hint}\n" if hint else ""
-        return llm.invoke(
-            f"You are reviewing a {lang_label} translation of an English portfolio card for semantic drift.\n"
-            f"{extra}\n"
-            f"ENGLISH CARD:\n{en_card}\n\n"
-            f"CURRENT TRANSLATION:\n{card}\n\n"
-            f"Describe concisely (2-4 bullet points) what you would change to fix the drift. "
-            f"Do NOT generate HTML yet — just explain your plan in plain text."
-        ).content.strip()
 
     def _maybe_update_en(instruction: str) -> None:
         """Rewrite EN card only if the user explicitly asks to update/fix/change the English card."""
@@ -1381,7 +1370,7 @@ def _handle_drift_interactive(
         elif choice == "n":
             return None
         elif choice == "y":
-            current_card = _retranslate(en_ref[0], feedback=critique)
+            current_card = _retranslate(current_card, feedback=critique)
         elif choice == "improve":
             concern = input("      Your concern or question: ").strip()
             response = _discuss(concern)
