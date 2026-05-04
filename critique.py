@@ -26,13 +26,13 @@ Evaluate the card against these criteria:
 2. **Structure** — does it use the correct Tailwind CSS classes (bg-white/dark:bg-gray-800, rounded-xl, shadow-md, p-6, text-xl font-semibold, text-sm text-gray-500, list-disc list-inside, text-blue-500 hover:underline)?
 3. **Length** — description should be 2-3 sentences, 2-3 bullet points, not more
 4. **No raw README** — should NOT just be a copy of the README intro
-5. **GitHub link** — must include a working link to the repo URL
+5. **GitHub link** — must include a working link to each repo URL
 
 REPO INFO:
 Name: {repo['name']}
 Description: {repo['description']}
 Languages: {', '.join(repo['languages'])}
-URL: {repo['url']}
+URL(s): {', '.join(repo.get('urls', [repo['url']]))}
 
 README (first 2000 chars):
 {repo['readme'][:2000]}

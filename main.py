@@ -10,11 +10,12 @@ from review import review_and_confirm
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python main.py <repo_name>")
-        print("Example: python main.py vr33ni/agent-morning-briefing")
+        print("Usage: python main.py <repo_name> [<repo_name2> ...]")
+        print("Example: python main.py vr33ni/my-frontend vr33ni/my-backend")
         sys.exit(1)
 
-    repo_name = sys.argv[1]
+    repo_names = sys.argv[1:]
+    repo_name = repo_names[0]
 
     # ===== CONFIGURE THIS =====
     PORTFOLIO_REPO = "vr33ni/portfolio"  # Your GitHub Pages repo
@@ -25,6 +26,7 @@ def main():
 
     initial_state = {
         "repo_name": repo_name,
+        "repo_names": repo_names,
         "portfolio_repo": PORTFOLIO_REPO,
         "repo_info": {},
         "summary_html": "",
@@ -38,7 +40,10 @@ def main():
         "pr_url": "",
     }
 
-    print(f"🔍 Reading repo: {repo_name}")
+    if len(repo_names) == 1:
+        print(f"🔍 Reading repo: {repo_name}")
+    else:
+        print(f"🔍 Reading repos: {', '.join(repo_names)}")
     print(f"📝 Will update: {PORTFOLIO_REPO}")
     print()
 

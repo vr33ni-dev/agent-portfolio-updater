@@ -13,7 +13,9 @@ def create_pr(state: PortfolioState) -> dict:
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(state["portfolio_repo"])
 
-    project_name = state["repo_info"]["name"]
+    project_name = state["repo_info"]["name"]  # used for branch naming/lookup
+    all_names = state["repo_info"].get("names", [project_name])
+    display_name = " + ".join(all_names)
     default_branch = repo.default_branch
 
     # Check for an existing open PR for this project
@@ -54,14 +56,17 @@ def create_pr(state: PortfolioState) -> dict:
             branch=branch_name,
         )
 
+    urls = state["repo_info"].get("urls", [state["repo_info"]["url"]])
+    repos_line = "\n".join(f"Repo: {u}" for u in urls)
+    langs_line = f"Languages: {', '.join(state['repo_info']['languages'])}"
+
     if existing_pr:
-        # Update the PR title/body to reflect the refresh
         existing_pr.edit(
-            title=f"Update {project_name} in portfolio",
+            title=f"Update {display_name} in portfolio",
             body=(
-                f"Automated PR to update **{project_name}** in the portfolio.\n\n"
-                f"Repo: {state['repo_info']['url']}\n"
-                f"Languages: {', '.join(state['repo_info']['languages'])}\n"
+                f"Automated PR to update **{display_name}** in the portfolio.\n\n"
+                f"{repos_line}\n"
+                f"{langs_line}\n"
             ),
         )
         print(f"\n✅ PR updated: {existing_pr.html_url}")
@@ -69,14 +74,14 @@ def create_pr(state: PortfolioState) -> dict:
 
     # Create the PR
     pr = repo.create_pull(
-        title=f"Add {project_name} to portfolio",
+        title=f"Add {display_name} to portfolio",
         body=(
-            f"Automated PR to add **{project_name}** to the portfolio.\n\n"
+            f"Automated PR to add **{display_name}** to the portfolio.\n\n"
             f"## Generated Summary\n"
             f"Review the project card below and edit if needed before merging.\n\n"
             f"---\n"
-            f"Repo: {state['repo_info']['url']}\n"
-            f"Languages: {', '.join(state['repo_info']['languages'])}\n"
+            f"{repos_line}\n"
+            f"{langs_line}\n"
         ),
         head=branch_name,
         base=default_branch,

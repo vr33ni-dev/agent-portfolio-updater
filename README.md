@@ -149,6 +149,12 @@ PR_REVIEWER = "yourusername"
 python main.py username/repo-name
 ```
 
+### Add or update multiple projects (app consisting of frontend and backend)
+
+```bash
+python main.py username/reponame-frontend username/reponame-backend
+```
+
 ### Audit all existing cards
 
 ```bash

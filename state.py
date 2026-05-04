@@ -3,7 +3,8 @@ from typing import TypedDict
 
 class PortfolioState(TypedDict):
     # Inputs
-    repo_name: str              # e.g. "vr33ni/agent-morning-briefing"
+    repo_name: str              # primary repo, e.g. "vr33ni/agent-morning-briefing"
+    repo_names: list            # all repos for this card (multi-repo support)
     portfolio_repo: str         # e.g. "vr33ni/vr33ni.github.io"
 
     # Data gathered by nodes

@@ -101,7 +101,8 @@ def update_portfolio(state: PortfolioState) -> dict:
         "work.de.html": state["summary_html_de"],
     }
 
-    repo_url = state["repo_info"]["url"]
+    repo_urls = state["repo_info"].get("urls", [state["repo_info"]["url"]])
+    repo_url = repo_urls[0]   # primary URL — used for insertion position
     original_url = state["repo_info"].get("original_url", "")
     updated_files = []
 
@@ -118,8 +119,16 @@ def update_portfolio(state: PortfolioState) -> dict:
         current_html = fetched[portfolio_file]["html"]
         card_html = lang_map[portfolio_file]
 
-        # Try canonical URL first; fall back to original URL in case of repo transfer
+        # Try each repo URL to detect and replace an existing card
         updated_html, action = _replace_or_insert(current_html, card_html, repo_url, MARKER)
+        if action == "added":
+            for extra_url in repo_urls[1:]:
+                updated_html2, action2 = _replace_or_insert(current_html, card_html, extra_url, MARKER)
+                if action2 == "updated":
+                    updated_html, action = updated_html2, action2
+                    break
+
+        # Fall back to original URL in case of repo transfer
         if action == "added" and original_url and original_url.rstrip("/") != repo_url.rstrip("/"):
             updated_html2, action2 = _replace_or_insert(current_html, card_html, original_url, MARKER)
             if action2 == "updated":
