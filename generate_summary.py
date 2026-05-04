@@ -102,16 +102,16 @@ Match this exact Tailwind CSS structure:
 """
 
     lang_instructions = [
-        ("en", "English"),
-        ("es", "Spanish"),
-        ("de", "German"),
+        ("en", "English", "Write the description and highlights in English."),
+        ("es", "Spanish", "Write the description and highlights in Spanish. Keep technical terms (framework names, languages, tools) in English."),
+        ("de", "German", "Write the description and highlights in German. Keep technical terms (framework names, languages, tools) in English."),
     ]
 
     from concurrent.futures import ThreadPoolExecutor
 
     def _invoke_lang(lang_instr):
-        lang, lang_label = lang_instr
-        return lang, llm.invoke(_build_prompt(lang_label)).content
+        lang, lang_label, lang_instruction = lang_instr
+        return lang, llm.invoke(_build_prompt(lang_label) + f"\nLanguage instruction: {lang_instruction}").content
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         results = dict(executor.map(_invoke_lang, lang_instructions))
